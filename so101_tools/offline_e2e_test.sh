@@ -184,11 +184,15 @@ fi
 # 判定"actor 的数据进了 learner 的 buffer"：看进度条的**分子**。
 # ⚠️ 不要匹配 "Filling up replay buffer: 12it" 那种"完成行" —— tqdm 不一定把它
 #    落盘（用 \r 覆盖），实测会漏判。直接解析 "| N/10" 更稳。
-FILL=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE '\| [0-9]+/10' | tail -1 | sed 's|.*/||;s|/.*||'")
-FILL2=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep 'Filling up replay buffer' | grep -oE '\| [0-9]+/' | tail -1 | tr -dc '0-9'")
-[ "${FILL2:-0}" -gt 0 ] 2>/dev/null \
-  && ok "actor 的数据进了 learner 的 buffer（进度条分子 ${FILL2}/10）" \
-  || bad "learner 没收到 actor 的数据（进度条分子 ${FILL2:-空}）"
+# tqdm 会输出**两种**形态，都要认（实测两种都出现过）：
+#   Filling up replay buffer: 24it [00:15, 23.97it/s]        ← 完成形式
+#   Filling up replay buffer:  40%|####| 4/10 [00:03<...]    ← 进行中形式
+FILL_A=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'buffer: *[0-9]+it' | tail -1 | tr -dc '0-9'")
+FILL_B=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE '\| *[0-9]+/10' | tail -1 | sed 's|/10||' | tr -dc '0-9'")
+FILL=${FILL_A:-0}; [ "${FILL_B:-0}" -gt "$FILL" ] 2>/dev/null && FILL=$FILL_B
+[ "${FILL:-0}" -gt 0 ] 2>/dev/null \
+  && ok "actor 的数据进了 learner 的 buffer（收到 ${FILL} 条）" \
+  || bad "learner 没收到 actor 的数据"
 [ "${LEARN_N:-0}" -ge 200 ] && ok "learner 完成 ${LEARN_N} 步训练（云端 GPU）" \
   || { [ "${LEARN_LAST:-0}" -gt 0 ] && ok "learner 训练中（${LEARN_LAST}%）" || bad "learner 没训练"; }
 echo "  learner 训练速率（it/s 序列尾部）: $(tr '\n' ' ' < "$LOCAL_DIR/learner_its.txt")"
