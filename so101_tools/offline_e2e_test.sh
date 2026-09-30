@@ -125,11 +125,14 @@ nohup env -u PYTHONPATH PYTHONPATH="$REPO/examples" \
   > "$LOCAL_DIR/actor.log" 2>&1 &
 ACTOR_PID=$!
 echo "  actor pid=$ACTOR_PID"
-sleep 8
-if grep -q "starting actor loop" "$LOCAL_DIR/actor.log"; then
-  ok "actor 起来了"
-else
-  bad "actor 没起来"; tail -8 "$LOCAL_DIR/actor.log"; fi
+# 要给足时间：actor 先要连上 learner 才会打印 "starting actor loop"（实测 ~10-20s）
+ACT_OK=0
+for _ in $(seq 1 30); do
+  sleep 1
+  if grep -q "starting actor loop" "$LOCAL_DIR/actor.log"; then ACT_OK=1; break; fi
+done
+[ "$ACT_OK" = 1 ] && ok "actor 起来了并进入交互循环" \
+  || { bad "actor 30s 内没进入循环"; tail -6 "$LOCAL_DIR/actor.log"; }
 
 # ---------------------------------------------------------------- 5) 握手
 note "5) 握手确认（learner 必须把初始网络推给 actor）"
@@ -143,27 +146,46 @@ done
 [ "$HS" -gt 0 ] && ok "握手成功：learner 已把初始网络推给 actor（${HS}s）" || bad "握手没完成"
 
 # ---------------------------------------------------------------- 6) 速率
-note "6) 跑 ${WAIT_RUN}s 看双边速率"
+note "6) 双边速率与 GPU 占用"
+# learner 默认只跑 200 步就退出（实测云端 ~47s），窗口开太长会在它退出后测到 0，
+# 所以握手成功后立刻采一次 GPU。
+$SSH "nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader" \
+    > "$LOCAL_DIR/gpu.txt" 2>&1
+echo "  云端 GPU（训练中）: $(cat "$LOCAL_DIR/gpu.txt")"
 sleep "$WAIT_RUN"
-$SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'learner: *[0-9]+%\|[^]]*\] *[0-9]+/[0-9]+ \[[^]]*\]' | tail -1" \
-   > "$LOCAL_DIR/learner_rate.txt" 2>&1
-tr '\r' '\n' < "$LOCAL_DIR/actor.log" | grep -oE '[0-9]+/[0-9]+ \[[^]]*\]' | tail -1 > "$LOCAL_DIR/actor_rate.txt"
+$SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'learner: *[0-9]+%\|[^]]*\]' | tail -1" \
+    > "$LOCAL_DIR/learner_rate.txt" 2>&1
+tr '\r' '\n' < "$LOCAL_DIR/actor.log" | grep -oE '[0-9]+/[0-9]+ \[[^]]*\]' | tail -1 \
+    > "$LOCAL_DIR/actor_rate.txt" 2>/dev/null
 echo "  learner 最后进度: $(cat "$LOCAL_DIR/learner_rate.txt")"
 echo "  actor   最后进度: $(cat "$LOCAL_DIR/actor_rate.txt")"
-LEARN_STEPS=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'learner: *[0-9]+%' | tail -1 | tr -dc '0-9'")
-ACT_STEPS=$(tr '\r' '\n' < "$LOCAL_DIR/actor.log" | grep -oE '[0-9]+/[0-9]+' | tail -1 | cut -d/ -f1)
-[ "${LEARN_STEPS:-0}" -gt 0 ] && ok "learner 已在训练（进度 ${LEARN_STEPS}%）" || bad "learner 没有训练进度"
-[ "${ACT_STEPS:-0}" -gt 0 ] && ok "actor 已在交互（已完成 ${ACT_STEPS} 步）" || bad "actor 没有步进"
 
-# GPU 占用
-$SSH "nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader" > "$LOCAL_DIR/gpu.txt" 2>&1
-echo "  云端 GPU: $(cat "$LOCAL_DIR/gpu.txt")"
+# learner 的训练速率：取 tqdm 里的 it/s 中位
+$SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE '[0-9.]+it/s' | tail -20 | sed 's|it/s||'" \
+    > "$LOCAL_DIR/learner_its.txt" 2>&1
+LEARN_LAST=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'learner: *[0-9]+%' | tail -1 | tr -dc '0-9'")
+LEARN_N=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE '\| [0-9]+/200' | tail -1 | tr -dc '0-9'")
+ACT_N=$(tr '\r' '\n' < "$LOCAL_DIR/actor.log" | grep -oE '[0-9]+/200' | tail -1 | cut -d/ -f1)
+# actor 日志里 tqdm 的进度条可能在同一行被 \r 覆盖，退而求其次用 "last return" 计数
+[ -z "$ACT_N" ] && ACT_N=$(tr '\r' '\n' < "$LOCAL_DIR/actor.log" | grep -c "last return")
+
+if $SSH "grep -q 'sent initial network to actor' $REMOTE_DIR/learner.log"; then
+  ok "learner 把初始网络推给了 actor（握手完成）"
+else
+  bad "没看到握手日志"
+fi
+$SSH "grep -q 'Filling up replay buffer: [0-9]*it' $REMOTE_DIR/learner.log" \
+  && ok "actor 的数据确实进了 learner 的 buffer（$( $SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'Filling up replay buffer: [0-9]+it' | tail -1" )）" \
+  || bad "learner 没收到 actor 的数据"
+[ "${LEARN_N:-0}" -ge 200 ] && ok "learner 完成 ${LEARN_N} 步训练（云端 GPU）" \
+  || { [ "${LEARN_LAST:-0}" -gt 0 ] && ok "learner 训练中（${LEARN_LAST}%）" || bad "learner 没训练"; }
+echo "  learner 训练速率（it/s 序列尾部）: $(tr '\n' ' ' < "$LOCAL_DIR/learner_its.txt")"
 
 # ---------------------------------------------------------------- 7) 上传
 note "7) demo 上传链路"
 LOCAL_UP="/tmp/so101_offline_test/upload_$STAMP"
 "${SO101_LOCAL_PY:-python}" "$HERE/push_demos.py" \
-    recordings_new/2026-09-30_004807_v1/ --out "$LOCAL_UP" --dry-run \
+    recordings_new/2026-09-30_004807_v1/ --out "$LOCAL_UP" --dry-run --all-failed \
     > "$LOCAL_DIR/upload.txt" 2>&1 || true
 if grep -qE "产出：.*pkl" "$LOCAL_DIR/upload.txt"; then
   grep -E "产出：" "$LOCAL_DIR/upload.txt" | sed 's/^/  /'
