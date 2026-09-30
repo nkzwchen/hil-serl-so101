@@ -27,6 +27,10 @@
 #    本地 Actor 侧需要 ROS2（rclpy，py3.12），环境不同，见 so101_env.sh
 
 jax[cuda12]==0.4.35
+# ★ jaxlib 必须与 jax **完全同版本**。只写 jax[cuda12]==0.4.35 时，
+#   pip 可能解析出 jaxlib 0.4.34 —— 症状是 jax 能认出 GPU（jax.devices() 正常）
+#   但**一跑计算就 Segmentation fault**，极难定位。实测踩过。
+jaxlib==0.4.35
 flax==0.10.4
 optax==0.2.5
 distrax==0.1.5
