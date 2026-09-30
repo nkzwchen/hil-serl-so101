@@ -90,10 +90,14 @@ def main():
     print('=' * 84)
     print(f'2) 上传到 {args.cloud}:{args.remote_dir}')
     print('=' * 84)
-    ssh_base = ['-P', str(args.port), '-o', 'BatchMode=yes']
+    # ⚠️ 端口参数大小写不同：**ssh 用小写 -p，scp 用大写 -P**。
+    #    混用会静默去连 22 端口然后失败（踩过）。
+    common = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new']
+    ssh_base = ['-p', str(args.port), *common]
+    scp_base = ['-P', str(args.port), *common]
     subprocess.run(['ssh', *ssh_base, args.cloud,
                     f'mkdir -p {args.remote_dir}'], check=True)
-    r = subprocess.run(['scp', *ssh_base, pkl, f'{args.cloud}:{args.remote_dir}/'])
+    r = subprocess.run(['scp', *scp_base, pkl, f'{args.cloud}:{args.remote_dir}/'])
     if r.returncode != 0:
         print('❌ scp 失败（检查密钥/端口）')
         return 1
