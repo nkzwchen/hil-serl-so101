@@ -32,6 +32,14 @@ is_up() {
 
 case "${1:-}" in
   start)
+    # ★ 先清残留：上一次没 stop 干净时，端口会被旧进程占着，
+    #   新建隧道会以 "bind: Address already in use" 失败（踩过）。
+    stale=$(pgrep -f "ssh .*-L ${REQ_PORT}:localhost:${REQ_PORT}" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$stale" ]; then
+      echo "  清理残留隧道: $stale"
+      for p in $stale; do kill "$p" 2>/dev/null; done
+      sleep 1
+    fi
     if is_up "$REQ_PORT" && is_up "$BC_PORT"; then
       echo "  隧道已在（$REQ_PORT/$BC_PORT 都在监听）"
     else
