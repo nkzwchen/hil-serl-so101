@@ -141,6 +141,11 @@ def main():
                     help='session directory, pkl file(s), or glob(s)')
     ap.add_argument('--out', default='demo_data', help='output directory')
     ap.add_argument('--dry-run', action='store_true', help='validate + report only')
+    ap.add_argument('--all-failed', action='store_true',
+                    help='如果**一段成功都没有**（全标成 failure/未标），就把所有段'
+                         '完整上传（reward 全 0，每段末尾 done）。RLPD 的离线 prior '
+                         'data 不要求带成功奖励，但这样上传的数据**学不到"成功"这个概念**，'
+                         '只当行为先验用。')
     ap.add_argument('--allow-frame0', action='store_true',
                     help='accept a success marked on frame 0 (rewards obs_0 with no '
                          'preceding action -- usually a labelling mistake)')
@@ -160,7 +165,7 @@ def main():
     print(f'  目标动作空间: {act_sp}')
     print()
 
-    kept, skipped, all_tr = [], [], []
+    kept, skipped, all_tr, all_raw = [], [], [], []
     for rec in pairs:
         fname = os.path.basename(rec)
         # 一个文件里可能有多段（见 so101_recording_io 的格式表），逐段取标签。
@@ -173,6 +178,8 @@ def main():
         multi = len(raw_eps) > 1
         for ei, trs in enumerate(raw_eps):
             name = f'{fname}#{ei}' if multi else fname
+            # ★ 先无条件登记：--all-failed 兜底要用到"所有段"，不只是成功段
+            all_raw.append((name, trs))
             lab = labs.get(ei)
             if lab is None:
                 skipped.append((name, '没有标签（还没标）'))
@@ -224,10 +231,39 @@ def main():
         for n, why in skipped:
             print(f'    · {n}: {why}')
     print()
+    if not all_tr and args.all_failed and all_raw:
+        # ── 兜底：一段成功都没有 → 按需求「全上传」────────────────────────
+        #    每段完整收进来，reward 全 0，只在段末 done/mask=0。
+        #    ⚠️ 这样上传的数据里**没有任何成功样本**，RLPD 只能拿它当行为先验，
+        #       学不到"成功"是什么。等有成功段时应当重跑（不要混用）。
+        print('  ⚠️ 没有任何成功段 → 按 --all-failed 全量上传（reward 全 0）')
+        all_tr = []
+        for name, trs in all_raw:
+            seg = [dict(t) for t in trs]
+            for i, t in enumerate(seg):
+                last = (i == len(seg) - 1)
+                t['rewards'] = 0.0
+                t['masks'] = 0.0 if last else 1.0
+                t['dones'] = bool(last)
+                if not isinstance(t.get('infos'), dict):
+                    t['infos'] = {}
+                t['infos'].pop('intervene_action', None)
+            bad = []
+            for i, t in enumerate(seg):
+                bad += [f'step{i}: {b}' for b in check(t)]
+            if bad:
+                print(f'    · {name}: 校验失败，跳过（{bad[:2]}）')
+                continue
+            all_tr += seg
+            kept.append(name + '(全)')
+        skipped = []
+        print(f'  全量收录 {len(kept)} 段')
+
     if not all_tr:
         print('❌ 一条 demo 都没有产出。')
         print('   常见原因：还没标定（label_demos.py）、全标成了失败、'
               '或成功帧标在了第 0 帧。')
+        print('   如果你就是要"全失败也上传"，加 --all-failed。')
         return 1
 
     n_steps = len(all_tr)
