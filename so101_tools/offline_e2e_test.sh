@@ -89,11 +89,18 @@ $SSH "set -e
   echo prep_ok" > "$LOCAL_DIR/learner_prep.txt" 2>&1
 $SSH "pkill -f '[t]rain_rlpd.py' 2>/dev/null; sleep 1; echo killed_old" >/dev/null 2>&1
 
-$SSH "cd $CLOUD_ROOT/so101-hil-serl/examples && nohup env PYTHONPATH=\$PWD $CLOUD_PY \
+# 为什么不用 `cd X && nohup ... &`：
+#   那样会把**整个 `cd && nohup` 组**放进后台子 shell，而该子 shell 会一直活着、
+#   持有 SSH 的 stdout 管道 → sshd 认为通道没关 → 本地 ssh 永不返回（实测卡 8 分钟）。
+#   必须：cd 单独一行 + setsid + 三个 fd 全部重定向。
+$SSH "cd $CLOUD_ROOT/so101-hil-serl/examples
+setsid nohup env PYTHONPATH=\$PWD $CLOUD_PY \
     train_rlpd.py --exp_name dummy_test --learner --ip 127.0.0.1 --debug \
     --checkpoint_path $CLOUD_ROOT/checkpoints/dummy_test \
     --demo_path $CLOUD_ROOT/demos/dummy_demos.pkl \
-    > $REMOTE_DIR/learner.log 2>&1 & echo started_pid=\$!" \
+    > $REMOTE_DIR/learner.log 2>&1 < /dev/null &
+sleep 1
+echo started_pid=\$!" \
   > "$LOCAL_DIR/learner_start.txt" 2>&1
 if grep -q "started_pid=" "$LOCAL_DIR/learner_start.txt"; then
   ok "learner 已在云端后台启动（$(cat "$LOCAL_DIR/learner_start.txt")）"
