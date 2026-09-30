@@ -191,8 +191,11 @@ echo "  learner 训练速率（it/s 序列尾部）: $(tr '\n' ' ' < "$LOCAL_DIR
 # ---------------------------------------------------------------- 7) 上传
 note "7) demo 上传链路"
 LOCAL_UP="/tmp/so101_offline_test/upload_$STAMP"
+# ⚠️ 必须用**绝对路径**：脚本的工作目录不一定是项目根，
+#    相对路径会得到 "ERROR: no recording files found"（踩过）。
+REC_DIR="${SO101_RECORDINGS:-$(dirname "$REPO")/recordings_new/2026-09-30_004807_v1}"
 "${SO101_LOCAL_PY:-python}" "$HERE/push_demos.py" \
-    recordings_new/2026-09-30_004807_v1/ --out "$LOCAL_UP" --dry-run --all-failed \
+    "$REC_DIR" --out "$LOCAL_UP" --dry-run --all-failed \
     > "$LOCAL_DIR/upload.txt" 2>&1 || true
 if grep -qE "产出：.*pkl" "$LOCAL_DIR/upload.txt"; then
   grep -E "产出：" "$LOCAL_DIR/upload.txt" | sed 's/^/  /'
