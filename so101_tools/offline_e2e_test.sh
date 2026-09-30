@@ -171,7 +171,7 @@ echo "  actor   最后进度: $(cat "$LOCAL_DIR/actor_rate.txt")"
 $SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE '[0-9.]+it/s' | tail -20 | sed 's|it/s||'" \
     > "$LOCAL_DIR/learner_its.txt" 2>&1
 LEARN_LAST=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'learner: *[0-9]+%' | tail -1 | tr -dc '0-9'")
-LEARN_N=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE '\| [0-9]+/200' | tail -1 | tr -dc '0-9'")
+LEARN_N=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep 'learner:' | grep -oE '\| [0-9]+/200' | tail -1 | sed 's|[^0-9]*||;s|/.*||'")
 ACT_N=$(tr '\r' '\n' < "$LOCAL_DIR/actor.log" | grep -oE '[0-9]+/200' | tail -1 | cut -d/ -f1)
 # actor 日志里 tqdm 的进度条可能在同一行被 \r 覆盖，退而求其次用 "last return" 计数
 [ -z "$ACT_N" ] && ACT_N=$(tr '\r' '\n' < "$LOCAL_DIR/actor.log" | grep -c "last return")
@@ -181,9 +181,14 @@ if $SSH "grep -q 'sent initial network to actor' $REMOTE_DIR/learner.log"; then
 else
   bad "没看到握手日志"
 fi
-$SSH "grep -q 'Filling up replay buffer: [0-9]*it' $REMOTE_DIR/learner.log" \
-  && ok "actor 的数据确实进了 learner 的 buffer（$( $SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE 'Filling up replay buffer: [0-9]+it' | tail -1" )）" \
-  || bad "learner 没收到 actor 的数据"
+# 判定"actor 的数据进了 learner 的 buffer"：看进度条的**分子**。
+# ⚠️ 不要匹配 "Filling up replay buffer: 12it" 那种"完成行" —— tqdm 不一定把它
+#    落盘（用 \r 覆盖），实测会漏判。直接解析 "| N/10" 更稳。
+FILL=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep -oE '\| [0-9]+/10' | tail -1 | sed 's|.*/||;s|/.*||'")
+FILL2=$($SSH "tr '\r' '\n' < $REMOTE_DIR/learner.log | grep 'Filling up replay buffer' | grep -oE '\| [0-9]+/' | tail -1 | tr -dc '0-9'")
+[ "${FILL2:-0}" -gt 0 ] 2>/dev/null \
+  && ok "actor 的数据进了 learner 的 buffer（进度条分子 ${FILL2}/10）" \
+  || bad "learner 没收到 actor 的数据（进度条分子 ${FILL2:-空}）"
 [ "${LEARN_N:-0}" -ge 200 ] && ok "learner 完成 ${LEARN_N} 步训练（云端 GPU）" \
   || { [ "${LEARN_LAST:-0}" -gt 0 ] && ok "learner 训练中（${LEARN_LAST}%）" || bad "learner 没训练"; }
 echo "  learner 训练速率（it/s 序列尾部）: $(tr '\n' ' ' < "$LOCAL_DIR/learner_its.txt")"
