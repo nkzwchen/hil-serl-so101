@@ -74,6 +74,22 @@ say "3/6 升级 pip（并钉 setuptools，避免新版移除 distutils 之类的
 say "4/6 装 serl_launcher 的依赖（jax[cuda12]、flax、gymnasium…）"
 "$PY" -m pip install -r "$REPO_DIR/serl_launcher/requirements.txt"
 
+say "4.5/6 把 nvidia CUDA 轮子钉到 12.6 世代"
+# ★★ 这一步不能省 ★★
+#   requirements 里的 nvidia-* 都是 ">=x" 形式，pip 会装**最新**的（实测 12.9）。
+#   12.9 世代配 jax 0.4.35 的症状非常隐蔽：
+#     · import jax 正常、jax.devices() 正常、jax.default_backend() 返回 'gpu'
+#     · 但**第一次真正做计算**（XLA 编译 kernel）就 Segmentation fault，
+#       没有任何错误信息，靠 faulthandler 才看到崩在 pxla.py 的 __call__
+#   降到与 jax 0.4.35 同期的 12.6 世代后一切正常（4000³ fp32 151ms）。
+"$PY" -m pip install -q \
+  "nvidia-cublas-cu12==12.6.4.1" "nvidia-cuda-cupti-cu12==12.6.80" \
+  "nvidia-cuda-nvcc-cu12==12.6.85" "nvidia-cuda-nvrtc-cu12==12.6.85" \
+  "nvidia-cuda-runtime-cu12==12.6.77" "nvidia-cudnn-cu12==9.5.1.17" \
+  "nvidia-cufft-cu12==11.2.1.3" "nvidia-cusolver-cu12==11.6.1.9" \
+  "nvidia-cusparse-cu12==12.5.4.2" "nvidia-nccl-cu12==2.21.5" \
+  "nvidia-nvjitlink-cu12==12.6.85"
+
 say "5/6 装 agentlace（train_rlpd 的进程间通信，上游没写进 requirements）"
 # ⚠️ agentlace **不在 PyPI 上**（pip install agentlace 会报
 #    "No matching distribution found"）。必须从它的 GitHub 仓库装。
@@ -106,6 +122,16 @@ say "5.5/6 以 editable 方式装 serl_launcher（这样改代码不用重装）
 #    代理（http://127.0.0.1:7890，未必在跑），直接失败。
 #    agentlace 我们已经在上一步用 SSH 装好了，所以这里跳过依赖解析。
 "$PY" -m pip install -q --no-deps -e "$REPO_DIR/serl_launcher"
+
+# nvidia-cuda-nvcc-cu12 把 cuda_nvcc 做成了**命名空间包**（没有 __init__.py），
+# 而 jax 0.4.35 的 _try_cuda_nvcc_import() 会做 pathlib.Path(cuda_nvcc.__file__)，
+# __file__ 为 None 直接 TypeError、jax 根本 import 不了。
+# 补一个空 __init__.py 就正常了（比改 jax 源码干净）。
+NVCC_DIR="$ENV_PREFIX/lib/python${PY_VER}/site-packages/nvidia/cuda_nvcc"
+if [ -d "$NVCC_DIR" ] && [ ! -f "$NVCC_DIR/__init__.py" ]; then
+  printf '' > "$NVCC_DIR/__init__.py"
+  echo "  已给 nvidia/cuda_nvcc 补 __init__.py（jax 0.4.35 的兼容性坑）"
+fi
 
 say "6/6 校验"
 "$PY" - <<'PYEOF'
