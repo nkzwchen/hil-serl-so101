@@ -51,3 +51,10 @@ wandb >= 0.12.14
 pyzmq
 lz4
 cloudpickle
+
+# 6. opencv-python 必须 <5
+#    opencv-python 5.x 声明 `numpy>=2`，而上面的 scipy==1.11.4 要求 `numpy<1.28`
+#    ⇒ 两者不可能同时满足。装 5.x 会先把 numpy 顶到 2.x、再把 scipy 弄坏。
+#    （agentlace 的 setup.py 没钉 numpy，也会顺带把 numpy 顶上去，见
+#      so101_tools/setup_cloud_env.sh 末尾的兜底。）
+opencv-python<5

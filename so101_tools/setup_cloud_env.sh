@@ -94,8 +94,10 @@ echo "  agentlace @ $(git -C "$AGENTLACE_DIR" log --oneline -1)"
 
 # ⚠️ agentlace 的 setup.py 没钉 numpy，`pip install -e` 会把它**升到 2.x**，
 #    而 jax 0.4.35 与 scipy 1.11.4 都要求 numpy<2 —— 不退回就会在 import 时炸。
-"$PY" -m pip install -q "numpy<2"
-echo "  numpy 已钉回 $( "$PY" -c 'import numpy;print(numpy.__version__)' )"
+#    opencv-python 5.x 又声明 numpy>=2，所以它也得钉在 4.x。
+"$PY" -m pip install -q "numpy<2" "opencv-python<5" \
+    && echo "  numpy=$( "$PY" -c 'import numpy;print(numpy.__version__)' ) " \
+            "opencv=$( "$PY" -c 'import cv2;print(cv2.__version__)' )"
 
 say "5.5/6 以 editable 方式装 serl_launcher（这样改代码不用重装）"
 "$PY" -m pip install -q -e "$REPO_DIR/serl_launcher"
