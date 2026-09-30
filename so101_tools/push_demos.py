@@ -52,10 +52,26 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help='只构建不上传')
     ap.add_argument('--start-learner', action='store_true',
                     help='上传后顺手在云端起 learner（后台）')
+    ap.add_argument('--python', default=os.environ.get('SO101_PYTHON'),
+                    help='用哪个解释器跑 build_demos（默认当前解释器；'
+                         '可用环境变量 SO101_PYTHON 指定）')
     args = ap.parse_args()
 
+    # build_demos 要用装好依赖(a)的那个解释器。在 base 环境里直接跑本脚本时，
+    # sys.executable 往往是**没装 gymnasium 的那个 python**，构建会因为
+    # ModuleNotFoundError 失败，而报错信息看起来像"没标定"，很容易误导。
+    py = args.python or sys.executable
+    probe = subprocess.run([py, '-c', 'import gymnasium, numpy'],
+                           capture_output=True)
+    if probe.returncode != 0:
+        print(f'❌ 解释器 {py} 里没有 gymnasium/numpy —— build_demos 会失败。')
+        print('   请先 activate 环境，或用 SO101_PYTHON / --python 指定，例如：')
+        print('     source so101_env.sh && python so101_tools/push_demos.py ...')
+        return 2
+    print(f'  构建用解释器：{py}')
+
     # ---------- 1) 构建 ----------
-    cmd = [sys.executable, os.path.join(HERE, 'build_demos.py'),
+    cmd = [py, os.path.join(HERE, 'build_demos.py'),
            *args.recordings, '--out', args.out]
     if args.all_failed:
         cmd.append('--all-failed')
