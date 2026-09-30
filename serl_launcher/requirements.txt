@@ -1,22 +1,53 @@
+# serl_launcher 依赖（已按实测校准）
+#
+# ── 与原版的差异及原因 ────────────────────────────────────────────────
+# 1. 删掉 tensorflow / tf-keras / tensorflow_probability(顶层)
+#    代码审计结果：全代码库只有 3 处用到 TF，且都是鸡毛蒜皮：
+#      · common/typing.py      仅类型标注 tf.Tensor        → 已删
+#      · utils/train_utils.py   tf.io.gfile.GFile 读文件    → 改标准库 open
+#      · wrappers/video_recorder.py  tf.io.gfile 读写文件   → 改 os/open
+#    已改完，故 TF 可完全移除。TF + jax 的版本组合是最大的冲突源。
+#    （注：tensorflow_probability 仍会被 distrax 0.1.5 作为传递依赖带进来，
+#      但它不依赖 TF，体积小，无需处理。）
+#
+# 2. jax 必须钉 0.4.35
+#    HIL-SERL 是 2024 年的代码，用的是 jax 0.4.x API；jax 0.5+ 移除了部分 API。
+#    而在 Python 3.10 下，jax/jaxlib/flax 的最高可用版本本身就受限
+#    （jax 最新版要求 >=3.12），所以钉 0.4.35 是唯一稳定选择。
+#
+# 3. distrax 必须钉 0.1.5（Python 3.10 约束）
+#    distrax >=0.1.7 要求 Python >=3.11，py3.10 下最高只能装 0.1.5。
+#    这也是 tfp 被带进来的原因。
+#
+# 4. scipy 钉 1.11.4（原版就钉了，保持）
+#
+# 5. 删掉 pre-commit（仅开发工具，训练不需要）
+#
+# ── 注意：本文件用于「云端 learner」环境（Python 3.10，无 ROS2）────────
+#    本地 Actor 侧需要 ROS2（rclpy，py3.12），环境不同，见 so101_env.sh
+
+jax[cuda12]==0.4.35
+flax==0.10.4
+optax==0.2.5
+distrax==0.1.5
+chex==0.1.90
+
 gym >= 0.26
+gymnasium==0.29.1
 numpy>=1.24.3
-flax>=0.8.0
-distrax>=0.1.2
 ml_collections >= 0.1.0
-tqdm >= 4.60.0
-chex>=0.1.85
-optax>=0.1.5
 absl-py >= 0.12.0
 scipy==1.11.4
-wandb >= 0.12.14
-tensorflow>=2.15.0
-tensorflow_probability>=0.23.0
+tqdm >= 4.60.0
 einops >= 0.6.1
 imageio >= 2.31.1
 moviepy >= 1.0.3
-pre-commit==3.3.3
-gymnasium==0.29.1
-tf-keras
-pynput
-natsort
 matplotlib
+natsort
+pynput
+
+# 日志与网络（agentlace 走的是 zmq）
+wandb >= 0.12.14
+pyzmq
+lz4
+cloudpickle

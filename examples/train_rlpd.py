@@ -212,7 +212,14 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 intervention_count = 0
                 intervention_steps = 0
                 already_intervened = False
-                client.update()
+                # === 诊断：B0.2 调试用，确认数据是否真的同步到 learner ===
+                _upd_ok = client.update()
+                if os.environ.get("SERL_DEBUG_SYNC"):
+                    print(
+                        f"[ACTOR-SYNC] step={step} update()={_upd_ok} "
+                        f"local_ds={len(data_store)} intvn_ds={len(intvn_data_store)}",
+                        flush=True,
+                    )
                 obs, _ = env.reset()
 
         if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:

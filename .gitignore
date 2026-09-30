@@ -1,0 +1,40 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- 训练产出（体积大，不入库）----
+checkpoints/
+wandb/
+demos/
+demo_data/
+*.pkl.tmp
+**/demo_buffer/
+
+# ---- 录制数据 / 复盘产物（本机专属，不入库）----
+recordings/
+recordings_new/
+recordings_fixed/
+review_videos/
+review_new/
+wrist_captures/
+testdata/
+cam_probe/
+*.labels.json
+
+# ---- 本机标定与调试产物 ----
+*.log
+b02_*.log
+l1_feel_test.log
+.dryrun_out.txt
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
