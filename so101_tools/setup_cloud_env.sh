@@ -75,7 +75,18 @@ say "4/6 装 serl_launcher 的依赖（jax[cuda12]、flax、gymnasium…）"
 "$PY" -m pip install -r "$REPO_DIR/serl_launcher/requirements.txt"
 
 say "5/6 装 agentlace（train_rlpd 的进程间通信，上游没写进 requirements）"
-"$PY" -m pip install -q agentlace==0.1.3
+# ⚠️ agentlace **不在 PyPI 上**（pip install agentlace 会报
+#    "No matching distribution found"）。必须从它的 GitHub 仓库装。
+#    钉住 commit 保证两端一致：本机装的就是 cf2c337 / version 0.1.3。
+AGENTLACE_DIR="${AGENTLACE_DIR:-$ROOT/agentlace}"
+AGENTLACE_COMMIT="${AGENTLACE_COMMIT:-cf2c337}"
+if [ ! -d "$AGENTLACE_DIR/.git" ]; then
+  git clone -q https://github.com/youliangtan/agentlace.git "$AGENTLACE_DIR"
+fi
+git -C "$AGENTLACE_DIR" fetch -q origin
+git -C "$AGENTLACE_DIR" checkout -q "$AGENTLACE_COMMIT"
+"$PY" -m pip install -q -e "$AGENTLACE_DIR"
+echo "  agentlace @ $(git -C "$AGENTLACE_DIR" log --oneline -1)"
 
 say "5.5/6 以 editable 方式装 serl_launcher（这样改代码不用重装）"
 "$PY" -m pip install -q -e "$REPO_DIR/serl_launcher"
