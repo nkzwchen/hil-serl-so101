@@ -80,13 +80,22 @@ say "5/6 装 agentlace（train_rlpd 的进程间通信，上游没写进 require
 #    钉住 commit 保证两端一致：本机装的就是 cf2c337 / version 0.1.3。
 AGENTLACE_DIR="${AGENTLACE_DIR:-$ROOT/agentlace}"
 AGENTLACE_COMMIT="${AGENTLACE_COMMIT:-cf2c337}"
+# ★ 用 **SSH** 而不是 HTTPS：这类云主机常配了 clash 代理
+#   （git config http.proxy=http://127.0.0.1:7890）和 gh-proxy 重写，
+#   代理没起时 HTTPS 克隆会直接失败；而 GitHub 的 SSH 通常是通的。
+AGENTLACE_URL="${AGENTLACE_URL:-git@github.com:youliangtan/agentlace.git}"
 if [ ! -d "$AGENTLACE_DIR/.git" ]; then
-  git clone -q https://github.com/youliangtan/agentlace.git "$AGENTLACE_DIR"
+  # 用 -c 临时清掉代理与 url 重写，免得继承环境的坑
+  git -c http.proxy= -c https.proxy= clone -q "$AGENTLACE_URL" "$AGENTLACE_DIR"
 fi
-git -C "$AGENTLACE_DIR" fetch -q origin
 git -C "$AGENTLACE_DIR" checkout -q "$AGENTLACE_COMMIT"
 "$PY" -m pip install -q -e "$AGENTLACE_DIR"
 echo "  agentlace @ $(git -C "$AGENTLACE_DIR" log --oneline -1)"
+
+# ⚠️ agentlace 的 setup.py 没钉 numpy，`pip install -e` 会把它**升到 2.x**，
+#    而 jax 0.4.35 与 scipy 1.11.4 都要求 numpy<2 —— 不退回就会在 import 时炸。
+"$PY" -m pip install -q "numpy<2"
+echo "  numpy 已钉回 $( "$PY" -c 'import numpy;print(numpy.__version__)' )"
 
 say "5.5/6 以 editable 方式装 serl_launcher（这样改代码不用重装）"
 "$PY" -m pip install -q -e "$REPO_DIR/serl_launcher"
