@@ -74,22 +74,32 @@ fi
 
 # ---------------------------------------------------------------- 2) learner
 note "2) 云端起 learner（dummy_test + 假 demo）"
+# ⚠️ 必须拆成两条 SSH 调用！
+#    如果把 `pkill -f '[t]rain_rlpd.py'` 和 nohup 启动写在**同一条** ssh 命令里，
+#    那条命令的**命令行文本本身就包含 "train_rlpd.py"**，于是 pkill 会把远端
+#    shell 自己杀掉 —— 后面的 nohup 永远不执行，而且没有任何报错（本会话踩过：
+#    测试显示"learner 启动失败"但日志文件是空的）。
+#    方括号技巧（[t]）只在"模式是命令行里唯一的出现处"时才有效。
 $SSH "set -e
   cd $CLOUD_ROOT/so101-hil-serl && git pull -q --ff-only
   mkdir -p $CLOUD_ROOT/demos $REMOTE_DIR
   [ -f $CLOUD_ROOT/demos/dummy_demos.pkl ] || ( cd $CLOUD_ROOT/so101-hil-serl/examples && \
       PYTHONPATH=\$PWD $CLOUD_PY gen_dummy_demos.py --out $CLOUD_ROOT/demos/dummy_demos.pkl >/dev/null )
-  pkill -f '[t]rain_rlpd.py' || true
   rm -rf $CLOUD_ROOT/checkpoints/dummy_test          # 必须不存在，否则等 input()
-  cd $CLOUD_ROOT/so101-hil-serl/examples
-  nohup env PYTHONPATH=\$PWD $CLOUD_PY train_rlpd.py \
-    --exp_name dummy_test --learner --ip 127.0.0.1 --debug \
+  echo prep_ok" > "$LOCAL_DIR/learner_prep.txt" 2>&1
+$SSH "pkill -f '[t]rain_rlpd.py' 2>/dev/null; sleep 1; echo killed_old" >/dev/null 2>&1
+
+$SSH "cd $CLOUD_ROOT/so101-hil-serl/examples && nohup env PYTHONPATH=\$PWD $CLOUD_PY \
+    train_rlpd.py --exp_name dummy_test --learner --ip 127.0.0.1 --debug \
     --checkpoint_path $CLOUD_ROOT/checkpoints/dummy_test \
     --demo_path $CLOUD_ROOT/demos/dummy_demos.pkl \
-    > $REMOTE_DIR/learner.log 2>&1 &
-  echo learner_pid=\$!" > "$LOCAL_DIR/learner_start.txt" 2>&1
-grep -q "learner_pid=" "$LOCAL_DIR/learner_start.txt" && ok "learner 已在云端后台启动" \
-  || { bad "learner 启动失败"; cat "$LOCAL_DIR/learner_start.txt"; }
+    > $REMOTE_DIR/learner.log 2>&1 & echo started_pid=\$!" \
+  > "$LOCAL_DIR/learner_start.txt" 2>&1
+if grep -q "started_pid=" "$LOCAL_DIR/learner_start.txt"; then
+  ok "learner 已在云端后台启动（$(cat "$LOCAL_DIR/learner_start.txt")）"
+else
+  bad "learner 启动失败"; cat "$LOCAL_DIR/learner_start.txt"
+fi
 
 # 等 learner 就绪（出现 "Filling up replay buffer" 就是起来了）
 note "3) 等 learner 就绪（最多 ${WAIT_START}s）"
