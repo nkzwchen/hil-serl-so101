@@ -144,13 +144,13 @@ export DATA_DIR=/root/gpufree-data/demos/human_reviewed_20261010_trial
   --host 127.0.0.1 --port 6006 --reload_interval 2
 ```
 
-本地转发端口后，浏览器访问 http://localhost:6006 ：
+本次看板已启动，本地访问 **http://localhost:16006**（本地 16006 转发到云端 6006）。新会话需要转发端口时：
 
 ```bash
-ssh -N -L 6006:127.0.0.1:6006 -p SSH_PORT USER@HOST
+ssh -N -L 16006:127.0.0.1:6006 -p SSH_PORT USER@HOST
 ```
 
-已有 SSH ControlMaster 时，也可以使用 `ssh -S /tmp/so101_train.sock -O forward -L 6006:127.0.0.1:6006 -p SSH_PORT USER@HOST` 加入端口转发，无需重开训练连接。
+已有 SSH ControlMaster 时，也可以使用 `ssh -S /tmp/so101_train.sock -O forward -L 16006:127.0.0.1:6006 -p SSH_PORT USER@HOST` 加入端口转发，无需重开训练连接。
 
 | TensorBoard 标签 | 含义 / 横轴 |
 |---|---|
