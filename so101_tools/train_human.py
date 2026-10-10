@@ -56,6 +56,18 @@ def validated_policy_agent(agent, candidate, obs):
     return candidate_agent
 
 
+def stop_server(server):
+    # Agentlace.stop closes REP from the caller thread while recv is active.
+    # Let its receive timeout exit the worker before closing ZeroMQ resources.
+    server.req_rep_server.is_kill = True
+    thread = getattr(server, 'thread', None)
+    if thread is not None:
+        thread.join()
+    server.stop()
+    server.broadcast_server.socket.close(linger=0)
+    server.broadcast_server.context.term()
+
+
 def train(args):
     import fcntl
     out = Path(args.out).resolve()
@@ -250,7 +262,7 @@ def _train_locked(args, out):
             print(f'Serving for {args.serve_seconds}s after training (no updates)', flush=True)
             stop.wait(args.serve_seconds)
     finally:
-        if server:server.stop()
+        if server:stop_server(server)
         for sig, handler in old_handlers.items():signal.signal(sig, handler)
 
 

@@ -50,6 +50,21 @@ class OnlineTests(unittest.TestCase):
         self.assertFalse(p.before_episode())
         self.assertEqual(len(applied),1)
 
+    def test_server_worker_exits_before_socket_close(self):
+        from types import SimpleNamespace
+        from train_human import stop_server
+        events=[]
+        rep=SimpleNamespace(is_kill=False)
+        def join():
+            self.assertTrue(rep.is_kill);events.append('joined')
+        def close():
+            self.assertEqual(events,['joined']);events.append('closed')
+        server=SimpleNamespace(req_rep_server=rep,thread=SimpleNamespace(join=join),stop=close,
+            broadcast_server=SimpleNamespace(socket=SimpleNamespace(close=lambda **_:None),
+                                             context=SimpleNamespace(term=lambda:None)))
+        stop_server(server)
+        self.assertEqual(events,['joined','closed'])
+
     def test_bad_policy_and_network_failure_preserve_version(self):
         old=dict(ok=True,step=1,spec={},run_id='run')
         def offline(_):raise OSError('offline')
