@@ -8,7 +8,7 @@
 - state 为 `(1,18)`，含目标误差、补偿、六关节位置和速度。三路图像为 `(1,224,224,3)`。
 - RECORD/RETURN 冻结 wrist_flex、wrist_roll、gripper；归位阶段另有腕部调整流程。
 - 录制原始奖励保持 0。每段结束后人工标注，learner 只接收已标注完整段，不使用奖励模型。
-- 成功 observation 帧 k 对应 transition k-1 奖励 1，并在该步终止；人工失败整段奖励 0，末步终止。未标注、排除段、缺步段拒收。
+- 成功 observation 帧 k 对应 transition k-1 奖励 1，并在该步终止；人工失败整段奖励 0，记录结束但末步保留 bootstrap（mask=1），避免把超时/人工截断误当物理终止。通信保护中断、未标注、排除段、缺步段拒收。
 - 图像质量标记保留并计数，不强制丢弃；标签本身不能修复过期图像。粗标签默认拒收，只有流程验证显式允许。
 
 ## 本地录制与复核
@@ -29,17 +29,26 @@ DISPLAY=:0 python so101_tools/label_demos.py /path/session/*.pkl
 ```bash
 export PYTHONPATH="$PWD/serl_launcher:$PWD/examples:${PYTHONPATH:-}"
 python so101_tools/train_human.py train --data /path/session --out training_runs/run1 \
-  --steps 1000 --batch-size 32 --serve-seconds 3600
+  --continuous --steps 100 --updates-per-transition 0.25 --max-runtime-seconds 3600
 ```
 
-默认使用预训练 ResNet-10，三路图像 SAC。首次没有在线已标注数据时只采样 demonstrations；收到在线段后每批一半 demonstrations、一半 online。`--steps` 是本次梯度更新数，不是录制步数。每 `--checkpoint-every` 次更新（默认 100 次）及更新结束后保存完整优化器和参数，重新加载并比较动作。`--serve-seconds` 是更新完成后的服务保留时长；服务期间只收段/提供参数，不继续梯度更新，继续训练需再次启动并恢复检查点。当前数据保存在内存，训练规模应按云端 RAM 调整。
+默认读取 `TrainConfig.batch_size=64`、`cta_ratio=2`、`discount=0.99`，可用 `--batch-size` / `--cta-ratio` 显式覆盖，实际配置写入 `learning_config.json` 和检查点。一次更新周期包含 2 次 Critic 更新（最后一次同时更新 Actor/温度），日志 step 是周期数。
+
+`--continuous` 保持接收服务：初始 `--steps` 个更新周期，加上每条已审核在线 transition 带来的 `--updates-per-transition` 个周期（累计后向下取整）。默认每 4 条在线数据提供 1 个周期，即 2 次 Critic 更新；这只是保守起点，并非已验证最优比例。重复提交不增加额度。额度用完进入 `waiting_for_labels`，新段提交后自动恢复 `training`。`--max-runtime-seconds` 限制本次服务运行时长，默认 3600 秒；到期保存退出，单次进行中的 GPU 更新/检查点写入会先完成。没有新数据时不会无限复训旧数据。
+
+整段在线数据进入在线池，保留前缀内的人工接管步骤同时加入示范池；没有在线数据时只抽示范，否则每批约各半（推荐偶数 batch）。两池容量各 50000，使用相同 transition 引用；图像仍在内存，长时间运行需要关注 RAM。
 
 ```bash
-python so101_tools/train_human.py train --data /path/session --out training_runs/run2 \
-  --resume training_runs/run1/checkpoint_1000.msgpack --steps 1000 --batch-size 32
+python so101_tools/train_human.py train --data /path/session --out training_runs/run1 \
+  --resume training_runs/run1/checkpoint_100.msgpack \
+  --continuous --updates-per-transition 0.25 --max-runtime-seconds 3600
 ```
 
-恢复时模型配置必须一致；采样 RNG 不恢复，因此不是逐位相同的训练续跑。收录回执和指标保存在输出目录。数据/标签独立于 Git 上传，凭据不写入仓库。
+连续模式恢复时沿用检查点中的初始额度与已完成 step，`--steps` 不会再次赠送额度；`updates-per-transition` 和训练配置必须一致。模型、优化器、采样 RNG 都恢复，数据池从原始文件和收录回执重建（不保证并发上传情况下逐位复现）。每 100 周期、额度耗尽、正常退出时保存，`latest.json` 指向最近完整检查点。SIGTERM/Ctrl-C 请求在当前更新周期完成后保存退出。硬杀进程可能需要从上个检查点重算。
+
+旧检查点首次迁移必须显式加 `--migrate-replay-semantics`：重新构建接管示范池和失败/超时 bootstrap 语义，保留原始文件与旧检查点；这不是旧训练的逐位续跑。启动前不要将未标注或排除文件放进 learner inbox。
+
+不加 `--continuous` 仍可做有限步测试；此时 `--steps` 是本次额外更新周期数，`--serve-seconds` 仅保留接收服务，不继续训练。收录回执、指标和数据/标签独立于 Git，凭据不写入仓库。
 
 粗标签仅验证链路：上述 train 命令增加 `--allow-provisional`，所得策略禁止驱动 actor。
 
@@ -90,7 +99,7 @@ python so101_tools/train_human.py retry-delivery \
 
 pending_label 会重新打开窗口；已确认但网络失败的段直接重试上传和提交。已确认接收的相同内容不重复上传，回执丢失重试由 learner 去重。
 
-actor 整场仍固定模型权重；本次实现不改变权重更新策略。learner 必须在线：梯度更新期间提交的数据可参与后续更新；若处于更新结束后的 serve 窗口，需要恢复训练才会学习新段。标注、网络传输都在段边界执行，不插入 env.step 控制循环。
+actor 启动下载一次模型；每段 READY 按 c 后、RECORD 计时前再检查新权重。仅同一 run、相同配置且 step 更大的权重才会通过张量/动作检查后加载；整段保持固定版本，原始 meta.policy 记录 run_id、step、spec。网络不可用保留旧权重并提示；不同 run 或不兼容配置拒绝开始新段，需要明确重启 actor。仍采用确定性动作，不在此变更中加入随机探索。标注、传输与模型检查都在段边界，不插入 env.step。提交确认表示已入库，不表示本段已训练完；下一段只取当时最新完成的版本，不等待指定训练步数。
 
 服务端重复提交去重；已收录段改标签需停止并重建 replay，防止新旧奖励混用。训练入口拒绝旧的 `train_rlpd.py --exp_name so101`，避免把原始 0 奖励直接加入训练。
 
@@ -111,7 +120,7 @@ cd /root/gpufree-data/so101-human-reward
   --data /root/gpufree-data/demos/human_smoke_inbox \
   --resume /root/gpufree-data/offline_test/human_reward_resume_20261010/checkpoint_5.msgpack \
   --out /root/gpufree-data/offline_test/human_next_run \
-  --steps 100 --batch-size 4 --allow-provisional
+  --steps 100 --batch-size 4 --allow-provisional --migrate-replay-semantics
 ```
 
 人工修改标签后，应从头建立正式训练 run，去掉 `--resume` 和 `--allow-provisional`；旧粗标签检查点的奖励含义已经改变，入口会拒绝混用。

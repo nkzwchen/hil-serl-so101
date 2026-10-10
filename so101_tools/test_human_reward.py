@@ -43,6 +43,27 @@ class HumanRewardTests(unittest.TestCase):
         self.assertEqual(len(ts),4)
         self.assertTrue(all(t['rewards']==0 for t in ts))
         self.assertTrue(ts[-1]['dones'])
+        self.assertEqual(float(ts[-1]['masks']),1.)
+
+    def test_timeout_bootstraps_and_interventions_trim_with_success(self):
+        self.lab=dict(status='failed',reviewed=True,source='human_review')
+        self.meta['episode_timeout']=True
+        self.ts[1]['infos']['intervening']=True
+        self.ts[3]['infos']['intervening']=True
+        self.save()
+        ts,r=load_episode(self.path,self.cfg)
+        self.assertEqual(r['termination'],'timeout')
+        self.assertEqual(ts[-1]['masks'],1.)
+        self.lab=dict(status='success',frame=3,reviewed=True,source='human_review')
+        self.save()
+        ts,r=load_episode(self.path,self.cfg)
+        self.assertEqual(r['intervention_indices'],[1])
+        self.assertEqual(ts[-1]['masks'],0.)
+
+    def test_safety_interruption_not_an_absorbing_failure(self):
+        self.meta['safety_error']='feedback stale';self.save()
+        with self.assertRaisesRegex(ValueError,'Safety-interrupted'):
+            load_episode(self.path,self.cfg)
 
     def test_provisional_opt_in(self):
         self.lab=coarse_label(self.ts);self.save()

@@ -51,6 +51,8 @@ def load_episode(path, config, allow_provisional=False):
     meta, ts = raw['meta'], raw['transitions']
     if meta.get('operator_excluded') or meta.get('recording', {}).get('has_gaps'):
         raise ValueError('Excluded episode or missing recording steps')
+    if meta.get('safety_error'):
+        raise ValueError('Safety-interrupted episode retained locally; exclude from automatic training')
     expected = dict(action_semantics=config.ACTION_SEMANTICS,
                     observation_semantics=config.OBSERVATION_SEMANTICS,
                     action_scale_rad=config.ACTION_SCALE, action_joints=config.ACTION_JOINTS,
@@ -79,9 +81,12 @@ def load_episode(path, config, allow_provisional=False):
             raise ValueError('Invalid action')
         t = {key: raw_t[key] for key in ('observations', 'actions', 'next_observations')}
         final = i == end - 1
-        t.update(rewards=np.float32(success and final), masks=np.float32(not final), dones=final)
+        t.update(rewards=np.float32(success and final), masks=np.float32(not (success and final)), dones=final)
         result.append(t)
     receipt = dict(id=hashlib.sha256((digest + json.dumps(lab, sort_keys=True)).encode()).hexdigest(),
                    recording_sha256=digest, file=path.name, label=copy.deepcopy(lab),
+                   replay_semantics='human_terminal_success_bootstrap_cutoff_v2',
+                   termination='success' if success else ('timeout' if meta.get('episode_timeout') else 'manual_cutoff'),
+                   intervention_indices=[i for i,t in enumerate(ts[:end]) if t.get('infos', {}).get('intervening') is True or isinstance(t.get('infos', {}).get('intervening'), np.bool_) and bool(t['infos']['intervening'])],
                    transitions=len(result), capture=capture_summary(ts, meta), quality_flagged=sum(not t.get('infos', {}).get('quality_ok', True) for t in ts[:end]))
     return result, receipt

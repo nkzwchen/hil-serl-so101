@@ -557,6 +557,10 @@ def main(policy=None, on_episode_saved=None):
                 if redo:
                     continue          # 回到 PRECISE，ep 不变
 
+                if policy is not None and hasattr(policy, 'before_episode'):
+                    # READY has completed, no control step is in flight; deadline starts later.
+                    policy.before_episode()
+
                 # Refresh after the operator's READY wait without issuing a motor command.
                 # TrainConfig fixes this chain to ChunkingWrapper(SERLObsWrapper(raw)).
                 fresh_obs = env.env.observation(env.unwrapped._get_obs())
@@ -815,7 +819,7 @@ def main(policy=None, on_episode_saved=None):
                 if on_episode_saved is not None and not quit_now:
                     if not on_episode_saved(epfile, saved_meta):
                         delivery_failed = True
-                        print("标注/提交未完成，停止本次会话；完成补交后再启动下一场。")
+                        print("标注/提交未完成，停止本次会话；本段可稍后补交，也可放弃；可重新启动下一场。")
                         quit_now = True
 
             meta['n_discarded'] = n_discarded

@@ -41,63 +41,103 @@ def make_agent(args, config):
 
 
 def train(args):
+    import fcntl
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / '.learner.lock').open('a') as run_lock:
+        fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _train_locked(args, out)
+
+
+def _train_locked(args, out):
     import jax
     import numpy as np
+    import signal
     from flax import serialization
     from flax.core import freeze
     from agentlace.trainer import TrainerServer
     from experiments.so101.config import TrainConfig
     from experiments.so101.human_reward import load_episode
+    from online_training import HumanReplay, UpdateBudget, REPLAY_SEMANTICS
     cfg = TrainConfig()
-    out = Path(args.out).resolve()
-    out.mkdir(parents=True, exist_ok=True)
     inbox = Path(args.data).resolve()
-    demos, online, receipts = [], [], {}
+    replay = HumanReplay(cfg.replay_buffer_capacity)
     previous = {}
+    saved = {}
     if args.resume:
         manifest = Path(args.resume).parent / 'receipts.json'
         previous = {r['recording_sha256']: r for r in json.loads(manifest.read_text())}
+        saved = json.loads(Path(args.resume + '.json').read_text())
+    elif (out / 'receipts.json').exists():
+        raise ValueError('Run already exists; use --resume or a new --out')
     for path in sorted(inbox.glob('*.pkl')):
         ts, receipt = load_episode(path, cfg, args.allow_provisional)
-        if receipt['id'] in receipts:
-            continue  # Same episode under another filename must not double replay on restart.
-        if any(r['recording_sha256'] == receipt['recording_sha256'] for r in receipts.values()):
-            raise ValueError('Conflicting labels for duplicate recording in inbox')
         prior = previous.get(receipt['recording_sha256'])
         if prior and prior['id'] != receipt['id']:
             raise ValueError('Labels changed since checkpoint; start a new run')
-        receipt['role'] = prior.get('role', 'demo') if prior else ('online' if args.resume else 'demo')
-        (online if receipt['role'] == 'online' else demos).extend(ts)
-        receipts[receipt['id']] = receipt
-    if previous and not set(previous).issubset({r['recording_sha256'] for r in receipts.values()}):
+        role = prior.get('role', 'demo') if prior else ('online' if args.resume else 'demo')
+        replay.add(ts, receipt, role)
+    if previous and not set(previous).issubset({r['recording_sha256'] for r in replay.receipts.values()}):
         raise ValueError('Resume is missing previously ingested recordings')
-    if not demos:
+    if not replay.demos:
         raise ValueError('No labeled demonstrations')
-    print(f'Loaded {len(receipts)} episodes / {len(demos)} transitions; devices={jax.devices()}', flush=True)
+    print(f'Loaded {len(replay.receipts)} episodes / {len(replay.demos)} transitions; devices={jax.devices()}', flush=True)
     agent = make_agent(args, cfg)
     spec = dict(encoder=args.encoder, seed=args.seed, action_semantics=cfg.ACTION_SEMANTICS,
                 observation_semantics=cfg.OBSERVATION_SEMANTICS, image_keys=cfg.image_keys,
                 reward_source=cfg.REWARD_SOURCE, allow_provisional=args.allow_provisional,
                 action_scale_rad=cfg.ACTION_SCALE, env_hz=cfg.ENV_HZ,
                 pose_alignment=cfg.POSE_ALIGNMENT, roi_spec=cfg.roi_spec, main_roi_spec=cfg.main_roi_spec)
+    continuous = getattr(args, 'continuous', False)
+    batch_size = getattr(args, 'batch_size', None) or cfg.batch_size
+    cta_ratio = getattr(args, 'cta_ratio', None) or cfg.cta_ratio
+    max_runtime = getattr(args, 'max_runtime_seconds', 3600)
+    learning = dict(batch_size=batch_size, cta_ratio=cta_ratio, discount=cfg.discount,
+                    replay_semantics=REPLAY_SEMANTICS, capacity=cfg.replay_buffer_capacity)
     step = 0
     if args.resume:
-        saved = json.loads(Path(args.resume + '.json').read_text())
+        if saved.get('learning') and saved['learning'] != learning:
+            raise ValueError('Resume learning configuration differs; keep batch size/CTA/discount/replay semantics unchanged')
         if saved['spec'] != spec:
             raise ValueError('Checkpoint configuration differs')
+        if saved.get('learning', {}).get('replay_semantics') != REPLAY_SEMANTICS and not getattr(args, 'migrate_replay_semantics', False):
+            raise ValueError('Legacy checkpoint: explicitly pass --migrate-replay-semantics to rebuild cutoff masks/intervention replay')
         agent = agent.replace(state=serialization.from_bytes(agent.state, Path(args.resume).read_bytes()))
         step = saved['step']
-    lock = threading.Lock()
-    snapshot = dict(params=jax.device_get(agent.state.params), spec=spec, step=step)
-
+    budget = UpdateBudget(step, args.steps, getattr(args, 'updates_per_transition', .25))
+    if continuous and saved.get('budget'):
+        budget = UpdateBudget(**saved['budget'])
+        if budget.updates_per_transition != args.updates_per_transition:
+            raise ValueError('Resume must keep updates-per-transition; stored budget is authoritative')
+    run_id = saved.get('run_id', str(out))
+    rng = np.random.default_rng(args.seed)
+    if saved.get('sampler_state'):
+        rng.bit_generator.state = saved['sampler_state']
+    lock = threading.RLock()
+    stop = threading.Event()
+    snapshot = dict(params=jax.device_get(agent.state.params), spec=spec, step=step, run_id=run_id)
+    phase = 'starting'
+    def atomic_json(path, data):
+        tmp = path.with_suffix(path.suffix+'.tmp')
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(path)
+    def persist_receipts():
+        atomic_json(out / 'receipts.json', list(replay.receipts.values()))
+    def status():
+        return dict(ok=True, step=snapshot['step'], run_id=run_id, phase=phase,
+                    demo_transitions=len(replay.demos), online_transitions=len(replay.online),
+                    online_received=replay.online_received, intervention_transitions=replay.interventions_received,
+                    episodes=len(replay.receipts), learning=learning, continuous=continuous,
+                    updates_remaining=budget.remaining(step, replay.online_received) if continuous else None,
+                    spec=spec)
     def callback(kind, payload):
         try:
             if kind == 'status':
-                with lock:
-                    return dict(ok=True, step=snapshot['step'], demo_transitions=len(demos),
-                                online_transitions=len(online), episodes=len(receipts), spec=spec)
+                with lock:return status()
             if kind == 'policy':
                 with lock:
+                    if payload.get('run_id') == run_id and payload.get('step') == snapshot['step']:
+                        return dict(ok=True, unchanged=True, step=snapshot['step'], run_id=run_id)
                     return dict(ok=True, **snapshot)
             if kind == 'submit':
                 name = payload['file']
@@ -108,73 +148,94 @@ def train(args):
                     raise ValueError('Recording outside inbox')
                 ts, receipt = load_episode(path, cfg, args.allow_provisional)
                 with lock:
-                    duplicate = receipt['id'] in receipts
-                    if not duplicate:
-                        if any(r['recording_sha256'] == receipt['recording_sha256'] for r in receipts.values()):
-                            raise ValueError('Relabeled episode already ingested; restart learner to rebuild replay')
-                        receipt['role'] = 'online'
-                        online.extend(ts)
-                        receipts[receipt['id']] = receipt
-                        (out / 'receipts.json').write_text(json.dumps(list(receipts.values()), indent=2))
-                    return dict(ok=True, duplicate=duplicate, transitions=len(ts))
+                    duplicate = not replay.add(ts, receipt, 'online')
+                    # Retry durability even for duplicates if a prior write failed.
+                    persist_receipts()
+                    return dict(ok=True, duplicate=duplicate, transitions=len(ts),
+                                intervention_transitions=len(receipt.get('intervention_indices', [])),
+                                step=snapshot['step'], phase=phase)
             raise ValueError('Unknown request')
         except Exception as exc:
             return dict(ok=False, error=str(exc))
-
-    server = TrainerServer(wire_config(args.port), request_callback=callback) if args.serve_seconds else None
-    if server:
-        server.start(threaded=True)
+    server = TrainerServer(wire_config(args.port), request_callback=callback) if (continuous or args.serve_seconds) else None
     def save_checkpoint():
         checkpoint = out / f'checkpoint_{step}.msgpack'
         tmp = checkpoint.with_suffix('.tmp')
         tmp.write_bytes(serialization.to_bytes(agent.state))
         tmp.replace(checkpoint)
-        Path(str(checkpoint)+'.json').write_text(json.dumps(dict(spec=spec, step=step), indent=2))
+        with lock:
+            persist_receipts()
+            atomic_json(Path(str(checkpoint)+'.json'), dict(spec=spec, step=step, run_id=run_id,
+                        learning=learning, budget=budget.state() if continuous else None,
+                        sampler_state=rng.bit_generator.state, migrated_from=args.resume))
+        atomic_json(out / 'latest.json', dict(checkpoint=str(checkpoint), step=step))
         return checkpoint
-
-    rng = np.random.default_rng(args.seed)
-    (out / 'receipts.json').write_text(json.dumps(list(receipts.values()), indent=2))
+    old_handlers = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            old_handlers[sig] = signal.signal(sig, lambda *_: stop.set())
+    started = time.monotonic()
+    initial_step = step
+    last_saved = None
     try:
-        for _ in range(args.steps):
+        persist_receipts()
+        atomic_json(out / 'learning_config.json', dict(**learning, continuous=continuous,
+                    budget=budget.state(), max_runtime_seconds=max_runtime, run_id=run_id))
+        if server:server.start(threaded=True)
+        while not stop.is_set():
+            if continuous and time.monotonic()-started >= max_runtime:break
+            if not continuous and step-initial_step >= args.steps:break
             with lock:
-                n_online = args.batch_size // 2 if online else 0
-                picked = [demos[i] for i in rng.integers(len(demos), size=args.batch_size-n_online)]
-                if n_online:
-                    picked += [online[i] for i in rng.integers(len(online), size=n_online)]
-            batch = freeze(jax.tree_util.tree_map(lambda *xs: np.stack(xs), *picked))
-            agent, metrics = agent.update(batch)
-            metrics = jax.device_get(metrics)
-            if not all(np.isfinite(x).all() for x in jax.tree_util.tree_leaves(metrics)):
-                raise RuntimeError('Nonfinite training metrics')
+                credit = budget.remaining(step, replay.online_received)
+            if continuous and credit == 0:
+                phase = 'waiting_for_labels'
+                if last_saved != step:
+                    save_checkpoint(); last_saved = step
+                    print(f'Waiting for reviewed data at step {step}; update budget exhausted', flush=True)
+                stop.wait(.2)
+                continue
+            phase = 'training'
+            for critic_index in range(cta_ratio):
+                with lock:
+                    picked = replay.sample(rng, batch_size)
+                batch = freeze(jax.tree_util.tree_map(lambda *xs: np.stack(xs), *picked))
+                networks = frozenset({'critic'}) if critic_index < cta_ratio-1 else frozenset({'critic', 'actor', 'temperature'})
+                agent, metrics = agent.update(batch, networks_to_update=networks)
+                metrics = jax.device_get(metrics)
+                if not all(np.isfinite(x).all() for x in jax.tree_util.tree_leaves(metrics)):
+                    raise RuntimeError('Nonfinite training metrics')
             step += 1
             record = dict(step=step, metrics=jax.tree_util.tree_map(lambda x: np.asarray(x).tolist(), serialization.to_state_dict(metrics)))
-            with (out / 'metrics.jsonl').open('a') as f:
-                f.write(json.dumps(record)+'\n')
+            record['metrics']['schedule'] = dict(online_received=replay.online_received,
+                    intervention_received=replay.interventions_received, cta_ratio=cta_ratio,
+                    updates_remaining=budget.remaining(step, replay.online_received) if continuous else 0)
+            with (out / 'metrics.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
             print(f'update {step}: metrics finite', flush=True)
-            with lock:
-                snapshot.update(params=jax.device_get(agent.state.params), step=step)
+            # Publish a coherent snapshot only after the entire update cycle finishes.
+            parameters = jax.device_get(agent.state.params)
+            with lock:snapshot.update(params=parameters, step=step)
             if step % args.checkpoint_every == 0:
-                save_checkpoint()
+                save_checkpoint(); last_saved = step
+        phase = 'saving'
         checkpoint = save_checkpoint()
         restored = agent.replace(state=serialization.from_bytes(agent.state, checkpoint.read_bytes()))
-        obs = demos[0]['observations']
+        obs = replay.demos[0]['observations']
         before = np.asarray(agent.sample_actions(obs, argmax=True))
         after = np.asarray(restored.sample_actions(obs, argmax=True))
         np.testing.assert_allclose(before, after, rtol=0, atol=0)
         assert after.shape == (3,) and np.isfinite(after).all() and (np.abs(after) <= 1).all()
         report = dict(step=step, checkpoint=str(checkpoint), devices=[str(d) for d in jax.devices()],
-                      reload_action=after.tolist(), reload_equal=True, spec=spec,
-                      demo_transitions=len(demos), online_transitions=len(online))
-        (out / 'result.json').write_text(json.dumps(report, indent=2))
+                      reload_action=after.tolist(), reload_equal=True, spec=spec, learning=learning,
+                      demo_transitions=len(replay.demos), online_transitions=len(replay.online))
+        atomic_json(out / 'result.json', report)
         print(json.dumps(report), flush=True)
-        if server:
-            print(f'Serving for {args.serve_seconds}s after training', flush=True)
-            deadline = time.monotonic()+args.serve_seconds
-            while time.monotonic() < deadline:
-                time.sleep(.2)
+        if server and not continuous and not stop.is_set():
+            phase = 'serving_only'
+            print(f'Serving for {args.serve_seconds}s after training (no updates)', flush=True)
+            stop.wait(args.serve_seconds)
     finally:
-        if server:
-            server.stop()
+        if server:server.stop()
+        for sig, handler in old_handlers.items():signal.signal(sig, handler)
 
 
 def main():
@@ -183,7 +244,12 @@ def main():
     ap.add_argument('--data', default='recordings')
     ap.add_argument('--out', default='training_runs/human')
     ap.add_argument('--steps', type=int, default=10)
-    ap.add_argument('--batch-size', type=int, default=4)
+    ap.add_argument('--batch-size', type=int, help='Default: TrainConfig.batch_size')
+    ap.add_argument('--cta-ratio', type=int, help='Default: TrainConfig.cta_ratio')
+    ap.add_argument('--continuous', action='store_true', help='Train on reviewed-data credits; wait when credits are exhausted')
+    ap.add_argument('--updates-per-transition', type=float, default=.25)
+    ap.add_argument('--max-runtime-seconds', type=float, default=3600)
+    ap.add_argument('--migrate-replay-semantics', action='store_true')
     ap.add_argument('--checkpoint-every', type=int, default=100)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--encoder', choices=['resnet','resnet-pretrained'], default='resnet-pretrained')
@@ -199,8 +265,11 @@ def main():
     ap.add_argument('--ssh-control-path', help='Optional existing SSH ControlMaster socket')
     ap.add_argument('--record-args', nargs=argparse.REMAINDER, default=[])
     args = ap.parse_args()
-    if args.steps < 0 or args.batch_size < 1 or args.serve_seconds < 0 or args.checkpoint_every < 1:
+    if args.steps < 0 or (args.batch_size is not None and args.batch_size < 2) or (args.cta_ratio is not None and args.cta_ratio < 1) or args.serve_seconds < 0 or args.checkpoint_every < 1:
         ap.error('Invalid counts')
+    import math
+    if not math.isfinite(args.updates_per_transition) or args.updates_per_transition < 0 or not math.isfinite(args.max_runtime_seconds) or args.max_runtime_seconds <= 0:
+        ap.error('Invalid continuous training budget/runtime')
     if args.mode == 'train':
         train(args)
         return
@@ -265,13 +334,27 @@ def main():
                     raise ValueError('Untrained policy cannot drive hardware')
                 if result['spec'].get('allow_provisional'):
                     raise ValueError('Provisional smoke-test policy cannot drive hardware')
-                # Download once before opening hardware; no network requests in control loop.
+                # Initial download precedes hardware; refresh only at RECORD boundaries.
                 import record_demo_so101
                 sys.argv = ['record_demo_so101.py', *args.record_args]
                 print('Policy loaded. SPACE toggles intervention. Each saved episode opens human review, then uploads.', flush=True)
-                def policy(obs):
-                    return np.asarray(agent.sample_actions(obs, argmax=True))
-                policy.metadata = dict(step=result['step'], spec=result['spec'])
+                from online_training import EpisodePolicy
+                def apply_policy(candidate):
+                    nonlocal agent
+                    candidate_agent = agent.replace(state=agent.state.replace(params=jax.device_put(candidate['params'])))
+                    if jax.tree_util.tree_structure(candidate_agent.state.params) != jax.tree_util.tree_structure(agent.state.params):
+                        raise ValueError('Policy parameter structure mismatch')
+                    for new, old in zip(jax.tree_util.tree_leaves(candidate_agent.state.params), jax.tree_util.tree_leaves(agent.state.params)):
+                        if new.shape != old.shape or not np.isfinite(np.asarray(new)).all():
+                            raise ValueError('Invalid policy parameters')
+                    probe = np.asarray(candidate_agent.sample_actions(obs, argmax=True))
+                    if probe.shape != (3,) or not np.isfinite(probe).all() or np.any(np.abs(probe)>1):
+                        raise ValueError('Invalid refreshed policy action')
+                    agent = candidate_agent
+                policy = EpisodePolicy(result,
+                    lambda obs: np.asarray(agent.sample_actions(obs, argmax=True)),
+                    lambda meta: c.request('policy', {k:meta.get(k) for k in ('step','run_id')}),
+                    apply_policy)
                 rc = record_demo_so101.main(policy=policy, on_episode_saved=delivery.process)
                 if rc:
                     raise RuntimeError(f'Actor stopped (exit {rc}); raw files and delivery status retained')
