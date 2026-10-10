@@ -748,6 +748,8 @@ def main(policy=None, on_episode_saved=None):
                               safety_error=safety_error)
                 saved_meta = recorder.finish({
                         'index': ep, 'start_info': st,
+                        'native_feedback_diagnostics': (env.unwrapped.feedback_diagnostics()
+                            if hasattr(env.unwrapped, 'feedback_diagnostics') else None),
                         'episode_timeout': episode_timeout,
                         'episode_time_limit_s': ACTOR_EPISODE_SECONDS if policy is not None else None,
                         'policy': getattr(policy, 'metadata', None),

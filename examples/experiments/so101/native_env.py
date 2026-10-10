@@ -1,4 +1,5 @@
 """Recording/training env using verified LeRobot direct targets and ROS images."""
+import json
 import math
 import threading
 import time
@@ -16,6 +17,8 @@ class NativeSO101Env(SO101Env):
         self.pose_alignment=ALIGNMENT
         self._native_stop=threading.Event()
         self._native_feedback_error=None
+        self._native_feedback_failures=0
+        self._native_last_feedback_error=None
         super().__init__(*args,**kwargs)
         try:
             self._native_io=NativeJointIO()
@@ -50,11 +53,39 @@ class NativeSO101Env(SO101Env):
     def _native_poll(self):
         while not self._native_stop.is_set():
             tick=time.monotonic()
-            try:self._refresh_native()
+            try:
+                self._refresh_native()
+                if self._native_feedback_error is not None:
+                    self.node.get_logger().info('Native joint feedback recovered; control freshness checks remain active')
+                self._native_feedback_error=None
             except Exception as exc:
                 self._native_feedback_error=repr(exc)
-                break  # Freshness checks prevent further control; no silent stale reuse.
-            self._native_stop.wait(max(0,1/CONTROL_HZ-(time.monotonic()-tick)))
+                self._native_last_feedback_error=repr(exc)
+                self._native_feedback_failures+=1
+                # Retry reads only. Never fabricate timestamps or replay commands.
+                if self._native_feedback_failures==1 or tick-getattr(self,'_native_error_log_time',0.)>=1.:
+                    self.node.get_logger().error('Native joint read failed: '+repr(exc))
+                    self._native_error_log_time=tick
+            self._native_stop.wait(max(.01,1/CONTROL_HZ-(time.monotonic()-tick)))
+
+    def feedback_diagnostics(self):
+        now=time.monotonic()
+        return dict(follower_age_s=now-self._joint_stamp, leader_age_s=now-self._leader_stamp,
+                    feedback_error=self._native_feedback_error,
+                    last_feedback_error=self._native_last_feedback_error,
+                    feedback_failures=self._native_feedback_failures,
+                    io_events=self._native_io.diagnostics())
+
+    def step(self, action):
+        try:
+            return super().step(action)
+        except RuntimeError as exc:
+            diagnostic=self.feedback_diagnostics()
+            self.node.get_logger().error('Native control stopped: '+json.dumps(diagnostic))
+            raise RuntimeError(f'{exc}; native feedback_error={diagnostic["feedback_error"]}, '
+                               f'last_feedback_error={diagnostic["last_feedback_error"]}, '
+                               f'follower_age={diagnostic["follower_age_s"]:.3f}s, '
+                               f'leader_age={diagnostic["leader_age_s"]:.3f}s') from exc
 
     def set_leader_torque(self,on):return self._native_torque('leader',on)
     def set_follower_torque(self,on):return self._native_torque('follower',on)

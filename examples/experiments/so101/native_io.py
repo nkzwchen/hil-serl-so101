@@ -1,4 +1,6 @@
 """Exclusive LeRobot joint I/O. ROS is only used for images in native mode."""
+from collections import deque
+from contextlib import contextmanager
 import math
 import os
 from pathlib import Path
@@ -32,6 +34,8 @@ class NativeJointIO:
         from lerobot.teleoperators.so_leader.so_leader import SOLeader
         from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
         self.lock=threading.RLock()
+        self._diagnostic_lock=threading.Lock()
+        self._io_events=deque(maxlen=64)
         self.robots=dict(
             leader=SOLeader(SOLeaderTeleopConfig(port=PORTS['leader'],id='so101_leader_main',
                 calibration_dir=CALIBRATION/'teleoperators/so_leader',use_degrees=True)),
@@ -42,6 +46,7 @@ class NativeJointIO:
         self.bounds={}
         self.reset_bounds={}
         self.last_send={}
+        self._last_read_stamp={}
         try:
             for arm,robot in self.robots.items():
                 check_calibration_file(robot.calibration_fpath,arm)
@@ -59,14 +64,39 @@ class NativeJointIO:
             self.close()
             raise
 
-    def read(self,arm):
+    @contextmanager
+    def _operation(self, operation, arm):
+        requested=time.monotonic()
         with self.lock:
+            acquired=time.monotonic()
+            error=None
+            try:
+                yield
+            except Exception as exc:
+                error=repr(exc)
+                raise
+            finally:
+                finished=time.monotonic()
+                event=dict(operation=operation, arm=arm, requested_monotonic_s=requested,
+                           lock_wait_s=acquired-requested, io_duration_s=finished-acquired,
+                           finished_monotonic_s=finished, error=error)
+                with self._diagnostic_lock:
+                    self._io_events.append(event)
+
+    def diagnostics(self):
+        with self._diagnostic_lock:
+            return [dict(event) for event in self._io_events]
+
+    def read(self,arm):
+        with self._operation("read",arm):
             robot=self.robots[arm]
             raw=robot.bus.sync_read('Present_Position',normalize=False)
             values=robot.bus._normalize({robot.bus.motors[j].id:v for j,v in raw.items()})
             norm={j:values[robot.bus.motors[j].id] for j in JOINT_NAMES}
             q=np.asarray([math.radians(norm[j]) if j!='gripper' else norm[j]*math.pi/100 for j in JOINT_NAMES])
-            return q,time.monotonic(),raw
+            stamp=time.monotonic()
+            self._last_read_stamp[arm]=stamp
+            return q,stamp,raw
 
     def home_wrist_roll(self, target_rad):
         """Reset-only exception: slowly home follower roll, never the gripper."""
@@ -106,7 +136,7 @@ class NativeJointIO:
                 'duration_s':duration,'phase':'reset_only'}
 
     def send(self,arm,target):
-        return self._send(arm,target,CONTROLLED_JOINTS,self.bounds[arm])
+        return self._send(arm,target,CONTROLLED_JOINTS,self.bounds[arm],require_fresh=True)
 
     def enable_reset_wrist_flex(self):
         with self.lock:
@@ -122,7 +152,7 @@ class NativeJointIO:
     def send_reset_arm(self,target):
         return self._send('follower',target,JOINT_NAMES[:4],self.reset_bounds['follower'])
 
-    def _send(self,arm,target,joints,bounds):
+    def _send(self,arm,target,joints,bounds,require_fresh=False):
         q=np.asarray(target,float)
         if q.shape!=(len(joints),) or not np.isfinite(q).all():raise ValueError('Finite joint targets of the correct dimension required')
         lo,hi=bounds
@@ -132,7 +162,12 @@ class NativeJointIO:
                              f'allowed=[{math.degrees(lo[i]):.4f}, {math.degrees(hi[i]):.4f}]deg'
                              for i in np.flatnonzero(outside))
             raise ValueError(arm+' target outside firmware limits: '+details)
-        with self.lock:
+        with self._operation("send",arm):
+            # Lock contention may age feedback after env.step's initial check.
+            if require_fresh:
+                age=time.monotonic()-self._last_read_stamp.get(arm,float('-inf'))
+                if age>.25:
+                    raise RuntimeError(f'No fresh {arm} feedback at serial write: age={age:.3f}s; no command sent')
             robot=self.robots[arm]
             action={j+'.pos':math.degrees(q[i]) for i,j in enumerate(joints)}
             started=time.monotonic()
@@ -146,7 +181,7 @@ class NativeJointIO:
             return result
 
     def torque(self,arm,on):
-        with self.lock:
+        with self._operation("torque_on" if on else "torque_off",arm):
             bus=self.robots[arm].bus
             state=bus.sync_read('Torque_Enable',normalize=False)
             if on:
