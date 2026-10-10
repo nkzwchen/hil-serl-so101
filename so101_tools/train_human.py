@@ -377,6 +377,8 @@ def main():
                 rc = record_demo_so101.main(policy=policy, on_episode_saved=delivery.process)
                 if rc:
                     raise RuntimeError(f'Actor stopped (exit {rc}); raw files and delivery status retained')
+                result = dict(ok=True, initial_policy_step=result['step'],
+                              final_policy_step=policy.metadata['step'], run_id=policy.metadata.get('run_id'))
         print(json.dumps(result), flush=True)
     finally:
         c.stop()

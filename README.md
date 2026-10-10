@@ -2,6 +2,40 @@
 
 本仓库维护本地录制/actor 与云端 learner 的同一套代码。配套仓库为 `nkzwchen/so101-ros2`，开发分支 `feat/so101-human-reward-3d`。部署时记录并核对两个仓库的 commit；不要复制零散脚本覆盖环境。
 
+## 当前在线闭环（2026-10-11）
+
+正式 learner 已迁移到 `/root/gpufree-data/training_runs/human_online_20261011`，仍使用原 inbox `/root/gpufree-data/demos/human_reviewed_20261010_trial` 和 5688/5689 端口。本次服务窗口 1 小时；到期会保存退出，不会永久后台训练。TensorBoard 打开 http://localhost:16006 ，选择 `human_online_20261011` run。
+
+本地重新启动 actor 即可使用新逻辑（不要继续用旧进程）：
+
+```bash
+cd /home/nkzwchen/pi_project
+source so101_env.sh
+export DISPLAY=:0
+python hil-serl/so101_tools/train_human.py status
+python hil-serl/so101_tools/train_human.py actor \
+  --upload-host root@120.209.70.195 --upload-port 30555 \
+  --ssh-control-path /tmp/so101_train.sock \
+  --upload-dir /root/gpufree-data/demos/human_reviewed_20261010_trial \
+  --record-args --episodes 3 --note online_loop_trial
+```
+
+`status.phase=training` 表示正在更新；`waiting_for_labels` 表示服务在线、等待新增已标注数据，下一次提交会自动唤醒训练；旧有限步入口的 `serving_only` 不会训练。仍需提前启动相机，SSH 隧道需可用。每段仍人工回程与标注。
+
+云端服务到期后，使用最近检查点恢复（仅在旧 learner 已退出时执行）：
+
+```bash
+cd /root/gpufree-data/so101-human-reward
+SO101_CHECKPOINT=$(/root/gpufree-data/conda_envs/so101-hilserl/bin/python -c 'import json; print(json.load(open("/root/gpufree-data/training_runs/human_online_20261011/latest.json"))["checkpoint"])')
+/root/gpufree-data/conda_envs/so101-hilserl/bin/python so101_tools/train_human.py train \
+  --data /root/gpufree-data/demos/human_reviewed_20261010_trial \
+  --out /root/gpufree-data/training_runs/human_online_20261011 \
+  --resume "$SO101_CHECKPOINT" --continuous --steps 0 \
+  --updates-per-transition 0.25 --max-runtime-seconds 3600 --checkpoint-every 25
+```
+
+验证细节见 [在线闭环验证报告](docs/so101/online_loop_validation_20261011.md)。验证覆盖软件/云端链路，尚不代表模型已学会插入任务。
+
 ## 数据与控制约定
 
 - 动作是 pan、lift、elbow 三维相对关节目标请求，30 Hz、4°/步；以已接受目标为增量基准。人工和模型共用执行器。
