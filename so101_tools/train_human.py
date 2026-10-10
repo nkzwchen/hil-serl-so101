@@ -40,6 +40,22 @@ def make_agent(args, config):
                                discount=config.discount)
 
 
+def validated_policy_agent(agent, candidate, obs):
+    """Validate and warm up a candidate before the caller atomically swaps agents."""
+    import jax
+    import numpy as np
+    candidate_agent = agent.replace(state=agent.state.replace(params=jax.device_put(candidate['params'])))
+    if jax.tree_util.tree_structure(candidate_agent.state.params) != jax.tree_util.tree_structure(agent.state.params):
+        raise ValueError('Policy parameter structure mismatch')
+    for new, old in zip(jax.tree_util.tree_leaves(candidate_agent.state.params), jax.tree_util.tree_leaves(agent.state.params)):
+        if new.shape != old.shape or not np.isfinite(np.asarray(new)).all():
+            raise ValueError('Invalid policy parameters')
+    probe = np.asarray(candidate_agent.sample_actions(obs, argmax=True))
+    if probe.shape != (3,) or not np.isfinite(probe).all() or np.any(np.abs(probe)>1):
+        raise ValueError('Invalid refreshed policy action')
+    return candidate_agent
+
+
 def train(args):
     import fcntl
     out = Path(args.out).resolve()
@@ -341,16 +357,7 @@ def main():
                 from online_training import EpisodePolicy
                 def apply_policy(candidate):
                     nonlocal agent
-                    candidate_agent = agent.replace(state=agent.state.replace(params=jax.device_put(candidate['params'])))
-                    if jax.tree_util.tree_structure(candidate_agent.state.params) != jax.tree_util.tree_structure(agent.state.params):
-                        raise ValueError('Policy parameter structure mismatch')
-                    for new, old in zip(jax.tree_util.tree_leaves(candidate_agent.state.params), jax.tree_util.tree_leaves(agent.state.params)):
-                        if new.shape != old.shape or not np.isfinite(np.asarray(new)).all():
-                            raise ValueError('Invalid policy parameters')
-                    probe = np.asarray(candidate_agent.sample_actions(obs, argmax=True))
-                    if probe.shape != (3,) or not np.isfinite(probe).all() or np.any(np.abs(probe)>1):
-                        raise ValueError('Invalid refreshed policy action')
-                    agent = candidate_agent
+                    agent = validated_policy_agent(agent, candidate, obs)
                 policy = EpisodePolicy(result,
                     lambda obs: np.asarray(agent.sample_actions(obs, argmax=True)),
                     lambda meta: c.request('policy', {k:meta.get(k) for k in ('step','run_id')}),
