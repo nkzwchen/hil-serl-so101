@@ -324,7 +324,17 @@ def main(inject_camera_failure=False, inject_repeat=False, inject_safety_error=F
         def policy(obs):
             return np.array([.25,-.1,.2], dtype=np.float32)
         policy.metadata = {'step': 123}
-        rc = R.main(policy=policy if policy_mode else None)
+        delivered = []
+        def on_saved(path, meta):
+            with open(path, 'rb') as f:
+                saved = pickle.load(f)
+            assert len(saved['transitions']) == meta['n_steps']
+            delivered.append(path)
+            return True
+        rc = R.main(policy=policy if policy_mode else None,
+                    on_episode_saved=on_saved if policy_mode else None)
+        if policy_mode:
+            assert len(delivered) == 2, 'Hook must run after each completed save'
     finally:
         sys.argv = argv
 

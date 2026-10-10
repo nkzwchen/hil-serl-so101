@@ -169,8 +169,10 @@ def zoom_crop(img, center, zoom, pane_px, nearest=True):
 
 # ============================ GUI ============================
 class Labeler:
-    def __init__(self, root, paths):
+    def __init__(self, root, paths, review_once=False):
         self.root = root
+        self.review_once = review_once
+        self.review_confirmed = False
         self.paths = list(paths)
         self.fi = 0                     # 当前文件下标
         self.episodes = []
@@ -267,7 +269,7 @@ class Labeler:
         tk.Label(bar, text='   ', bg=BG).pack(side='left')
         _btn('< prev ep (p)', lambda: self._step_ep(-1), 11)
         _btn('next ep (n) >', lambda: self._step_ep(+1), 11)
-        _btn('save (w)', self._save, 10)
+        _btn('confirm + submit (w)' if self.review_once else 'save (w)', self._save, 19 if self.review_once else 10)
 
         self.lbl_info = tk.Label(self.root, text='', bg=BG, fg=FG, justify='left',
                                  anchor='w', font=('DejaVu Sans Mono', 10))
@@ -607,6 +609,12 @@ class Labeler:
     # ---------------- 保存 / 退出 ----------------
     def _save(self, quiet=False):
         path = self.paths[self.fi]
+        if self.review_once and not quiet:
+            lab = self.labels.get(0, {})
+            if not lab.get('reviewed') or lab.get('provisional') or lab.get('status') not in ('success', 'failed'):
+                from tkinter import messagebox
+                messagebox.showinfo('待人工确认', '请先标记成功帧或失败，再按 w 确认提交。')
+                return
         out = {
             'recording': os.path.abspath(path),
             'recording_sha256': self.recording_sha256,
@@ -621,9 +629,15 @@ class Labeler:
         os.replace(tmp, lp)
         if not quiet:
             print(f'  [save] {lp}')
+            if self.review_once:
+                self.review_confirmed = True
+                self.root.destroy()
         return lp
 
     def _quit(self):
+        if self.review_once:
+            self.root.destroy()
+            return
         if self.labels:
             try:
                 self._save(quiet=True)
@@ -638,6 +652,7 @@ class Labeler:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('recordings', nargs='+', help='recording pkl (globs ok)')
+    ap.add_argument('--review-once', action='store_true', help='单段人工复核，w 保存并关闭提交')
     args = ap.parse_args()
 
     paths = []
@@ -654,7 +669,9 @@ def main():
               "(unix socket; 127.0.0.1:0.0 does NOT work).")
     root = tk.Tk()
     try:
-        Labeler(root, paths)
+        if args.review_once and len(paths) != 1:
+            raise ValueError('--review-once requires exactly one recording')
+        app = Labeler(root, paths, review_once=args.review_once)
         # ★ 主动抢键盘焦点：否则窗口刚出来时方向键/空格可能被窗口管理器
         #   发给别的窗口，表现就是"按了没反应"。按钮栏是兜底，这个是直接修好。
         try:
@@ -666,7 +683,7 @@ def main():
         print(f'ERROR: startup failed: {type(e).__name__}: {e}')
         return 1
     root.mainloop()
-    return 0
+    return 0 if not args.review_once or app.review_confirmed else 3
 
 
 if __name__ == '__main__':

@@ -175,7 +175,7 @@ def train(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('mode', choices=['train','status','submit','policy-check','actor'])
+    ap.add_argument('mode', choices=['train','status','submit','policy-check','actor','retry-delivery'])
     ap.add_argument('--data', default='recordings')
     ap.add_argument('--out', default='training_runs/human')
     ap.add_argument('--steps', type=int, default=10)
@@ -189,6 +189,10 @@ def main():
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=5688)
     ap.add_argument('--file')
+    ap.add_argument('--upload-host', help='SSH user@host for automatic episode upload')
+    ap.add_argument('--upload-port', type=int, default=22)
+    ap.add_argument('--upload-dir', help='Absolute cloud learner --data directory')
+    ap.add_argument('--ssh-control-path', help='Optional existing SSH ControlMaster socket')
     ap.add_argument('--record-args', nargs=argparse.REMAINDER, default=[])
     args = ap.parse_args()
     if args.steps < 0 or args.batch_size < 1 or args.serve_seconds < 0 or args.checkpoint_every < 1:
@@ -196,8 +200,27 @@ def main():
     if args.mode == 'train':
         train(args)
         return
+    delivery = None
+    if args.mode in ('actor', 'retry-delivery'):
+        if not args.upload_host or not args.upload_dir:
+            ap.error('actor/retry-delivery requires --upload-host and --upload-dir')
+        if args.mode == 'retry-delivery' and not args.file:
+            ap.error('retry-delivery requires --file pointing to the local recording')
+        from episode_delivery import SSHUploader, EpisodeDelivery
+        from experiments.so101.config import TrainConfig
+        uploader = SSHUploader(args.upload_host, args.upload_dir, args.upload_port, args.ssh_control_path)
+        uploader.check()  # Before any hardware is opened.
     c = client(args)
     try:
+        if args.mode in ('actor', 'retry-delivery'):
+            delivery = EpisodeDelivery(TrainConfig(), uploader, lambda name: c.request('submit', {'file': name}))
+        if args.mode == 'retry-delivery':
+            status_path = Path(args.file).with_suffix('.delivery.json')
+            status = json.loads(status_path.read_text()) if status_path.exists() else {}
+            needs_review = status.get('status', 'pending_label') == 'pending_label'
+            if not delivery.process(args.file, review=needs_review):
+                raise RuntimeError('Pending delivery retained; see .delivery.json')
+            return
         kind = 'policy' if args.mode in ('policy-check', 'actor') else args.mode
         result = c.request(kind, dict(file=args.file))
         if not result or not result.get('ok'):
@@ -241,11 +264,13 @@ def main():
                 # Download once before opening hardware; no network requests in control loop.
                 import record_demo_so101
                 sys.argv = ['record_demo_so101.py', *args.record_args]
-                print('Policy loaded. SPACE toggles intervention. Episodes remain pending human labels.', flush=True)
+                print('Policy loaded. SPACE toggles intervention. Each saved episode opens human review, then uploads.', flush=True)
                 def policy(obs):
                     return np.asarray(agent.sample_actions(obs, argmax=True))
                 policy.metadata = dict(step=result['step'], spec=result['spec'])
-                record_demo_so101.main(policy=policy)
+                rc = record_demo_so101.main(policy=policy, on_episode_saved=delivery.process)
+                if rc:
+                    raise RuntimeError(f'Actor stopped (exit {rc}); raw files and delivery status retained')
         print(json.dumps(result), flush=True)
     finally:
         c.stop()

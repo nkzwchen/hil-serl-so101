@@ -381,7 +381,8 @@ def print_banner(env, args):
 
 
 # ===================================================================== main
-def main(policy=None):
+def main(policy=None, on_episode_saved=None):
+    delivery_failed = False
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='recordings', help='session parent directory')
     ap.add_argument('--episodes', type=int, default=30, help='how many episodes to record')
@@ -752,7 +753,7 @@ def main(policy=None):
                 review['quality_failed'] = saved_meta['quality_failed']
                 recorder = None
                 quality = []
-                if n_itv == 0:
+                if n_itv == 0 and policy is None:
                     quality.append('❌ 全程没有接管步（忘了进模式 B？）这一段没用')
                 if abs(hz_act - env.hz) > 1.0:
                     quality.append(f'⚠️ 实际频率 {hz_act:.1f}Hz 偏离目标 {env.hz:.0f}Hz '
@@ -786,6 +787,11 @@ def main(policy=None):
                 with open(os.path.join(outdir, 'meta.json'), 'w', encoding='utf-8') as f:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
                 ep += 1
+                if on_episode_saved is not None and not quit_now:
+                    if not on_episode_saved(epfile, saved_meta):
+                        delivery_failed = True
+                        print("标注/提交未完成，停止本次会话；完成补交后再启动下一场。")
+                        quit_now = True
 
             meta['n_discarded'] = n_discarded
             meta['n_operator_excluded'] = sum(e['operator_excluded'] for e in meta['episodes'])
@@ -799,9 +805,12 @@ def main(policy=None):
                   f'待排除 {meta["n_operator_excluded"]} 段，质量标记 {meta["n_quality_flagged"]} 段），'
                   f'写在 {outdir}')
             print('  meta.json + ep_XXXX.pkl')
-            print(f'  下一步：DISPLAY=:0 python recording_tools/label_demos.py {outdir}/*.pkl')
+            if on_episode_saved is None:
+                print(f'  下一步：DISPLAY=:0 python recording_tools/label_demos.py {outdir}/*.pkl')
+            else:
+                print('  自动标注/提交结果见每段同名 .delivery.json')
             print(f'{"=" * 78}')
-            return 0
+            return 2 if delivery_failed else 0
     except KeyboardInterrupt:
         print('\n中断（Ctrl-C）。')
         return 1

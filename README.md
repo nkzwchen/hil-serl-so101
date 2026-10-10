@@ -56,14 +56,35 @@ python so101_tools/train_human.py policy-check
 真机未来连接并完成验收后：
 
 ```bash
-python so101_tools/train_human.py actor --record-args --episodes 3 --note policy_trial
+python so101_tools/train_human.py actor \
+  --upload-host USER@HOST --upload-port SSH_PORT \
+  --upload-dir /path/to/learner/inbox \
+  --record-args --episodes 3 --note policy_trial
 ```
 
-actor 在打开硬件前下载本次策略，整场固定权重以避免网络阻塞控制。空格切换人工接管，RETURN 始终人工回程；仍使用录制器原有归位、READY 和数据保存流程。录完人工标注，将 pkl 和同名 labels.json 上传到 learner 的 `--data` 目录（使用唯一文件名，避免不同场次 ep_0000 覆盖），然后：
+`--upload-dir` 必须与当前 learner 的 `--data` 是同一目录。SSH 需已配置免交互登录；也可用 `--ssh-control-path /path/to/socket` 复用已认证的连接。启动时会先检查上传目录，再打开硬件。
+
+每段完整流程：
+
+1. READY 按 `c` 开始；空格切换人工接管，RECORD 按 `d` 结束执行。
+2. RETURN 人工回程，按 `c` 完成回程并保存原始段。
+3. 自动弹出本段标注窗口，此时控制循环暂停，不会进入下一段归位。选第一次成功的帧按 `s`，或按 `f` 标失败；按 **`w` 确认提交**并关闭窗口。
+4. 自动校验人工标签，上传 pkl 与 labels.json，收到 learner 确认后进入下一段准备。
+
+上传采用内容 ID 文件名，避免不同场次 ep_0000 覆盖；远端先写临时文件，再原子改名，最后提交 learner。每段同名 `.delivery.json` 记录 pending_label / pending_upload / pending_submit / submitted / excluded。
+
+关闭窗口视为取消，不算确认。取消、上传失败或 learner 拒收会结束本次 actor 会话，保留数据和待提交状态，不自动开始下一段。标排除或缺步的段仅保留本地，不上传训练。恢复网络后补交：
 
 ```bash
-python so101_tools/train_human.py submit --file session2_ep_0000.pkl
+python so101_tools/train_human.py retry-delivery \
+  --file /path/session/ep_0000.pkl \
+  --upload-host USER@HOST --upload-port SSH_PORT \
+  --upload-dir /path/to/learner/inbox
 ```
+
+pending_label 会重新打开窗口；已确认但网络失败的段直接重试上传和提交。已确认接收的相同内容不重复上传，回执丢失重试由 learner 去重。
+
+actor 整场仍固定模型权重；本次实现不改变权重更新策略。learner 必须在线：梯度更新期间提交的数据可参与后续更新；若处于更新结束后的 serve 窗口，需要恢复训练才会学习新段。标注、网络传输都在段边界执行，不插入 env.step 控制循环。
 
 服务端重复提交去重；已收录段改标签需停止并重建 replay，防止新旧奖励混用。训练入口拒绝旧的 `train_rlpd.py --exp_name so101`，避免把原始 0 奖励直接加入训练。
 
