@@ -64,4 +64,21 @@ class DeliveryTests(unittest.TestCase):
         self.assertFalse(self.uploads)
         self.assertEqual(self.status()['status'],'excluded')
 
+    def test_restart_deduplicates_alternate_filenames(self):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from train_human import train
+        duplicate = self.path.with_name('renamed.pkl')
+        duplicate.write_bytes(self.path.read_bytes())
+        duplicate.with_suffix('.labels.json').write_bytes(self.path.with_suffix('.labels.json').read_bytes())
+        args = SimpleNamespace(data=str(self.path.parent), out=str(self.path.parent/'run'), resume=None, allow_provisional=False)
+        output = io.StringIO()
+        with patch('train_human.make_agent', side_effect=RuntimeError('stop before model creation')):
+            with contextlib.redirect_stdout(output):
+                with self.assertRaisesRegex(RuntimeError, 'stop before model creation'):
+                    train(args)
+        self.assertIn('Loaded 1 episodes / 3 transitions', output.getvalue())
+
 if __name__=='__main__':unittest.main()
