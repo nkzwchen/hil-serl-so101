@@ -59,6 +59,10 @@ def train(args):
         previous = {r['recording_sha256']: r for r in json.loads(manifest.read_text())}
     for path in sorted(inbox.glob('*.pkl')):
         ts, receipt = load_episode(path, cfg, args.allow_provisional)
+        if receipt['id'] in receipts:
+            continue  # Same episode under another filename must not double replay on restart.
+        if any(r['recording_sha256'] == receipt['recording_sha256'] for r in receipts.values()):
+            raise ValueError('Conflicting labels for duplicate recording in inbox')
         prior = previous.get(receipt['recording_sha256'])
         if prior and prior['id'] != receipt['id']:
             raise ValueError('Labels changed since checkpoint; start a new run')
