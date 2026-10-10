@@ -70,7 +70,8 @@ def train(args):
     spec = dict(encoder=args.encoder, seed=args.seed, action_semantics=cfg.ACTION_SEMANTICS,
                 observation_semantics=cfg.OBSERVATION_SEMANTICS, image_keys=cfg.image_keys,
                 reward_source=cfg.REWARD_SOURCE, allow_provisional=args.allow_provisional,
-                action_scale_rad=cfg.ACTION_SCALE, env_hz=cfg.ENV_HZ)
+                action_scale_rad=cfg.ACTION_SCALE, env_hz=cfg.ENV_HZ,
+                pose_alignment=cfg.POSE_ALIGNMENT, roi_spec=cfg.roi_spec, main_roi_spec=cfg.main_roi_spec)
     step = 0
     if args.resume:
         saved = json.loads(Path(args.resume + '.json').read_text())
@@ -138,7 +139,7 @@ def train(args):
             if not all(np.isfinite(x).all() for x in jax.tree_util.tree_leaves(metrics)):
                 raise RuntimeError('Nonfinite training metrics')
             step += 1
-            record = dict(step=step, metrics={k: np.asarray(v).tolist() for k,v in metrics.items()})
+            record = dict(step=step, metrics=jax.tree_util.tree_map(lambda x: np.asarray(x).tolist(), serialization.to_state_dict(metrics)))
             with (out / 'metrics.jsonl').open('a') as f:
                 f.write(json.dumps(record)+'\n')
             print(f'update {step}: metrics finite', flush=True)
@@ -203,11 +204,21 @@ def main():
             from experiments.so101.config import TrainConfig
             args.encoder, args.seed = result['spec']['encoder'], result['spec']['seed']
             cfg = TrainConfig()
-            if result['spec']['action_semantics'] != cfg.ACTION_SEMANTICS:
-                raise ValueError('Policy/action semantics mismatch')
+            for key, expected in dict(action_semantics=cfg.ACTION_SEMANTICS,
+                                      observation_semantics=cfg.OBSERVATION_SEMANTICS,
+                                      image_keys=cfg.image_keys, action_scale_rad=cfg.ACTION_SCALE,
+                                      env_hz=cfg.ENV_HZ, pose_alignment=cfg.POSE_ALIGNMENT,
+                                      roi_spec=cfg.roi_spec, main_roi_spec=cfg.main_roi_spec).items():
+                if result['spec'].get(key) != expected:
+                    raise ValueError(f'Policy configuration mismatch: {key}')
             agent = make_agent(args,cfg)
             agent = agent.replace(state=agent.state.replace(params=jax.device_put(result.pop('params'))))
-            obs = cfg.get_environment(fake_env=True).observation_space.sample()
+            if args.file and args.mode == 'policy-check':
+                import pickle
+                with open(args.file, 'rb') as f:
+                    obs = pickle.load(f)['transitions'][0]['observations']
+            else:
+                obs = {k: np.zeros(s.shape, s.dtype) for k,s in cfg.get_environment(fake_env=True).observation_space.spaces.items()}
             action = np.asarray(agent.sample_actions(obs, argmax=True))
             assert action.shape == (3,) and np.isfinite(action).all() and (np.abs(action)<=1).all()
             result['test_action'] = action.tolist()
