@@ -5,15 +5,10 @@
               （env 是 follower 的唯一控制源，避免与 teleop 组件抢话题）
   · 观测源  ：/follower/joint_states（ros2_control 广播，io.yaml 同款）
               + /follower/cam_{main,wrist}/image_raw
-  · 动作空间：**3 维**关节增量，action ∈ [-1,1]^3，依次对应
-              shoulder_lift / elbow_flex / wrist_flex。
-              ★ shoulder_pan / wrist_roll / gripper 全部**冻结**，
-                **不进动作向量**（定义见 so101_home_pose.FROZEN_JOINTS）——
-                策略和人手在结构上就动不了它们。
-              ⚠️ 冻结 pan 的代价：末端被限制在一个竖直平面内，
-                 只剩 2 个平移自由度（实测点云 s3/s1 ≈ 1.5e-15）。
-  · 不用 RelativeFrame：它变换的是笛卡尔量（tcp_pose/tcp_vel），
-              关节增量没有坐标系，变换无意义。关节增量本身就是相对量。
+  · 动作空间：pan / shoulder_lift / elbow_flex / wrist_flex 的相对角度，4 维。
+              每关节最多 0.02rad/步；沿上一条已接受命令累积，保留归位补偿。
+              wrist_roll / gripper 冻结；动作阶段不运行 IK 或末端姿态约束。
+  · 不用 RelativeFrame：动作直接表达为关节角增量。
   · 力矩管理：/follower/set_torque、/leader/set_torque（L1 已实现）
 
 观测空间结构（必须符合 SERLObsWrapper 的契约）：
@@ -72,12 +67,16 @@ _SO101_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SO101_DIR not in sys.path:
     sys.path.insert(0, _SO101_DIR)
 
+from latest_frame import LatestFrameWorker
+from camera_observation import CAMERA_KEYS, decode_rgb, crop_roi
+from joint_control import CommandHold, bounded_joint_delta, ACTION_SEMANTICS, DEFAULT_STEP_RAD, execute_joint_request
+
 from so101_home_pose import (  # noqa: E402
     CONTROLLED_IDX, CONTROLLED_JOINTS, FROZEN_IDX, FROZEN_JOINTS,
     N_ACTION, N_ARM,
     RANDOMIZE_HALF_M, START_JOINT_POSE, action_to_joint_delta,
     follower_home_offset, hold_frozen, joint_delta_to_action,
-    leader_home_offset, min_jerk, randomize_start_pose, tool_z, tube_tilt_deg,
+    leader_home_offset, min_jerk, randomize_joint_start_pose, tool_z, tube_tilt_deg,
 )
 
 # 启动时算一次并缓存（内部用正运动学二分求解，不写死系数）
@@ -112,7 +111,8 @@ DEFAULT_HZ = 10.0
 DEFAULT_INTERVENE_DEADBAND = 0.05
 
 # 起始姿态实测反馈：单轮修正上限（rad），防跑飞
-START_FEEDBACK_MAX = 0.35          # ≈ 20°
+START_FEEDBACK_MAX = math.radians(3.0)  # per-pass correction cap
+START_ACCEPTANCE_TOL = math.radians(3.0)  # final settled joint residual limit
 
 
 class SO101Env(gym.Env):
@@ -121,23 +121,36 @@ class SO101Env(gym.Env):
     def __init__(
         self,
         hz: float = DEFAULT_HZ,
-        action_scale: float = 0.05,      # rad / 步（10Hz 下 ≈ 28.6°/s）
+        action_scale: float = DEFAULT_STEP_RAD,      # radians per joint per step
         max_episode_steps: int = 100,
         image_size: int = IMG_H,
         display_image: bool = False,
-        randomize_start: bool = True,            # 起始位置随机化（pan 水平弧）
+        randomize_start: bool = True,            # pan/lift/elbow 关节随机化
         randomize_half_m: float = RANDOMIZE_HALF_M,   # 水平弧半长（米）= 0.01 ⇒ ±1cm
         start_feedback_iters: int = 2,           # 起始姿态的实测反馈轮数（0=关闭）
         start_settle_s: float = 1.0,             # 每段斜坡后的沉降等待
         enable_keyboard: bool = True,            # 录制脚本会传 False，自己管接管状态
+        roi_spec=None,
+        main_roi_spec=None,
         node_name: str = 'so101_rl_env',
+        randomize_joint_half_deg: float = 1.5,
     ):
         super().__init__()
+        self.roi_spec = roi_spec
+        self.main_roi_spec = main_roi_spec
+        self.image_keys = list(CAMERA_KEYS) + (['cam_main_roi'] if roi_spec else [])
         self.hz = float(hz)
         self.action_scale = float(action_scale)
-        # ★ 起始位置随机化：只转 shoulder_pan ⇒ 末端沿水平弧 ±1cm 滑动
+        self.action_semantics = ACTION_SEMANTICS
+        self._command_hold = CommandHold()
+        self._last_joint_action = np.zeros(N_ACTION, dtype=np.float32)
+        self._joint_control_status = {}
+        # 起始位置：pan/lift/elbow 各自采样 ±1.5°，腕部补偿倾角。
         self.randomize_start = bool(randomize_start)
-        self.randomize_half_m = float(randomize_half_m)
+        self.randomize_half_m = float(randomize_half_m)  # legacy metadata only
+        self.randomize_joint_half_deg = float(randomize_joint_half_deg)
+        if not math.isfinite(self.randomize_joint_half_deg) or self.randomize_joint_half_deg < 0:
+            raise ValueError("randomize_joint_half_deg must be finite and nonnegative")
         self._rng = np.random.default_rng()
         # ★ 实测反馈：重力补偿是在**名义点**上标定的，换到随机点会有 1~2cm 偏差
         #   （舵机静摩擦死区同样贡献，实测可达 ~2cm）。所以量残差再补一轮 ——
@@ -171,6 +184,22 @@ class SO101Env(gym.Env):
         self._images: dict[str, np.ndarray] = {}          # key -> (128,128,3) uint8 RGB
         self._leader_pos: Optional[np.ndarray] = None     # (6,) rad，人类意图
         self._joint_stamp: float = 0.0
+        self._leader_stamp = 0.0
+        self._camera_stats = {k: {'received': 0, 'accepted': 0, 'errors': 0,
+                                 'arrival': 0.0, 'source_stamp_ns': 0,
+                                 'last_error': '', 'valid': False,
+                                 'first_arrival': 0.0, 'max_gap_s': 0.0,
+                                 'pending_replaced': 0, 'duplicate_messages': 0,
+                                 'processing_expired': 0, 'processing_delay_s': 0.0}
+                              for k in CAMERA_KEYS}
+        self._last_obs_quality = {}
+        self._image_workers = {
+            cam: LatestFrameWorker(
+                lambda msg, arrival, key=cam: self._process_image(msg, key, arrival),
+                name=f'{cam}_latest_frame',
+                on_error=lambda exc, key=cam: self._image_worker_error(key, exc))
+            for cam in CAMERA_KEYS}
+
 
         # QoS：图像这类高频大数据用 BEST_EFFORT 更稳（丢帧没关系）
         qos_img = QoSProfile(
@@ -253,17 +282,14 @@ class SO101Env(gym.Env):
             'state': gym.spaces.Dict({
                 'joint_pos': gym.spaces.Box(-np.pi, np.pi, (6,), dtype=f32),
                 'joint_vel': gym.spaces.Box(-np.inf, np.inf, (6,), dtype=f32),
+                'command_error': gym.spaces.Box(-np.inf, np.inf, (N_ACTION,), dtype=f32),
+                'hold_offset': gym.spaces.Box(-np.inf, np.inf, (N_ACTION,), dtype=f32),
             }),
-            'images': gym.spaces.Dict({
-                'cam_main': gym.spaces.Box(0, 255, (self.img_size, self.img_size, 3), dtype=np.uint8),
-                'cam_wrist': gym.spaces.Box(0, 255, (self.img_size, self.img_size, 3), dtype=np.uint8),
-            }),
+            'images': gym.spaces.Dict({k: gym.spaces.Box(
+                0, 255, (self.img_size, self.img_size, 3), dtype=np.uint8)
+                for k in self.image_keys}),
         })
-        # ★ 动作空间 = **3 维**，只覆盖受控关节（shoulder_lift / elbow_flex /
-        #   wrist_flex）。冻结的 shoulder_pan / wrist_roll / gripper
-        #   **根本不进动作向量** —— 策略和人手在结构上就动不了它们。
-        #   ⚠️ 夹爪不在动作空间里 ⇒ setup_mode 必须是
-        #      'single-arm-fixed-gripper'（见 config.py 与 so101_home_pose.py）。
+        # 3D tool-origin action; four joints remain actuated.
         self.action_space = gym.spaces.Box(-1.0, 1.0, (N_ACTION,), dtype=f32)
 
         # ---------- 内部状态 ----------
@@ -283,7 +309,7 @@ class SO101Env(gym.Env):
         #   ⚠️ 冻结 shoulder_pan 后，末端被限制在一个竖直平面内（2 个平移自由度）。
         self.node.get_logger().info(
             f'动作空间：跟随 {list(CONTROLLED_JOINTS)}；'
-            f'冻结 {list(FROZEN_JOINTS)}（指令=实测值，永不改变）'
+            f'冻结 {list(FROZEN_JOINTS)}（录制/跟随阶段不下发；初始化另行归位）'
         )
 
     # ================= 键盘（接管开关） =================
@@ -482,7 +508,7 @@ class SO101Env(gym.Env):
     def _enter_mode(self, mode: str):
         """切换控制模式并管理力矩（只在模式变化时执行一次）。
 
-        ★ 进入人类接管时**必须**记下差分基准 (follower 实测, leader 实测) —— 见 step()
+        ★ 进入人类接管时记下差分基准 (follower 已接受指令, leader 实测) —— 见 step()
           里模式 B 的说明。漏掉它会让从臂在接管瞬间跳回主臂所在姿态。
         """
         if mode == self._last_mode:
@@ -490,11 +516,18 @@ class SO101Env(gym.Env):
         if mode == 'human':
             # 人类接管：leader 必须松开，否则人手和电机较劲（抖振/发热）
             ok = self.set_leader_torque(False)
-            # ★ 差分基准：此刻从臂在哪、主臂在哪。之后从臂 = 基准 + (主臂 − 主臂基准)。
-            if self.leader_pos is not None and self.joint_pos is not None:
-                self._lead_anchor = np.asarray(self.leader_pos, float)[:N_ARM].copy()
-                self._foll_anchor = np.asarray(self.joint_pos, float)[:N_ARM].copy()
-                gap = float(np.abs(self._foll_anchor - self._lead_anchor).max())
+            if not ok:
+                raise RuntimeError('Leader torque OFF failed; refusing intervention')
+            # 从臂以已接受指令的几何目标为基准，不能混用尚有跟随滞后的
+            # 实测角度，否则主臂不动也会在接管时产生回退指令。
+            leader = self.leader_pos
+            follower = self.joint_pos
+            if leader is not None and follower is not None:
+                self._lead_anchor = np.asarray(leader, float)[:N_ARM].copy()
+                self._foll_anchor = (self._command_hold.target() - self._command_hold.offset)
+                aligned=(self.leader_pose_in_follower_coordinates(leader)
+                         if hasattr(self,'leader_pose_in_follower_coordinates') else np.asarray(leader))
+                gap = float(np.abs(np.asarray(follower)[list(CONTROLLED_IDX)] - aligned[list(CONTROLLED_IDX)]).max())
                 self.node.get_logger().info(
                     f'>>> 人类接管（leader 力矩 OFF: {ok}）差分基准已记录，'
                     f'两臂当前相差 {math.degrees(gap):.1f}°')
@@ -505,8 +538,10 @@ class SO101Env(gym.Env):
                     f'差分基准缺失，本步骤将退化为保持不动')
         else:
             # 回到 policy：leader 恢复力矩，重新跟随 follower
-            self._lead_anchor = self._foll_anchor = None
             ok = self.set_leader_torque(True)
+            if not ok:
+                raise RuntimeError('Leader torque ON failed; refusing policy mode')
+            self._lead_anchor = self._foll_anchor = None
             self.node.get_logger().info(f'<<< 回到 policy（leader 力矩 ON: {ok}）')
         self._last_mode = mode
 
@@ -541,54 +576,107 @@ class SO101Env(gym.Env):
             self._joint_pos = pos
             if vel is not None:
                 self._joint_vel = vel
-            self._joint_stamp = time.time()
+            self._joint_stamp = time.monotonic()
 
     def _on_leader(self, msg: JointState):
         pos = self._reorder(msg)
         if pos.shape == (6,):
             with self._lock:
                 self._leader_pos = pos
+                self._leader_stamp = time.monotonic()
 
     def _on_image(self, msg: Image, key: str):
-        """把 ROS2 Image 转成 (H, W, 3) uint8。
+        arrival = time.monotonic()
+        with self._lock:
+            self._camera_stats[key]['received'] += 1
+        if self._image_workers[key].submit(msg, arrival):
+            with self._lock:
+                self._camera_stats[key]['pending_replaced'] += 1
 
-        ⚠️ 颜色顺序说明：
-          usb_cam 的配置写的是 pixel_format="mjpeg2rgb"，理论上输出 rgb8，
-          但不同版本行为不一致（有的仍发 bgr8）。这里**按 msg.encoding 判断**，
-          而不是硬假设，避免"图看着正常但通道反了"这种隐蔽 bug
-          （对 reward classifier 影响很大：橙子/盘子颜色会失真）。
+    def _image_worker_error(self, key, exc):
+        with self._lock:
+            stats = self._camera_stats[key]
+            stats['errors'] += 1
+            stats['valid'] = False
+            stats['last_error'] = str(exc)
+        self.node.get_logger().error(f'[{key}] image processing failed: {exc}')
 
-          内部统一存 **RGB**（HIL-SERL 的 RSCapture 也是 RGB）。
-
-        分辨率：相机可能不是 640x480（全局相机我们配了 640x480，
-        腕部是 424x240），所以一律 resize 到 img_size。
-        """
+    def _process_image(self, msg: Image, key: str, arrival):
+        stamp = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+        with self._lock:
+            stats = self._camera_stats[key]
+            previous_stamp = stats['source_stamp_ns']
+            if stamp > 0 and stamp == previous_stamp:
+                stats['duplicate_messages'] += 1
+                return  # Reuse is normal; do not make an old frame look fresh.
         try:
-            if msg.encoding not in ('rgb8', 'bgr8', '8UC3', ''):
-                # 其它编码（如 yuv422）暂不支持，直接丢弃该帧
-                return
-            arr = np.frombuffer(msg.data, dtype=np.uint8)
-            img = arr.reshape((msg.height, msg.width, -1))[:, :, :3]
-            if img.shape[0] != self.img_size or img.shape[1] != self.img_size:
-                img = cv2.resize(img, (self.img_size, self.img_size),
-                                 interpolation=cv2.INTER_AREA)
-            # 统一成 RGB
-            if msg.encoding == 'bgr8':
-                img = img[:, :, ::-1].copy()
-            else:
-                img = img.copy()
-            # 记录一次实际编码，便于排查
-            if getattr(self, '_last_encoding', {}).get(key) != msg.encoding:
-                self._last_encoding = getattr(self, '_last_encoding', {})
-                self._last_encoding[key] = msg.encoding
-                self.node.get_logger().info(
-                    f'[{key}] 图像编码 = {msg.encoding!r}，'
-                    f'{msg.width}x{msg.height} -> {self.img_size}x{self.img_size}'
-                )
-        except Exception:
+            if stamp <= 0 or stamp < previous_stamp:
+                raise ValueError('Missing or backwards camera timestamp')
+            with self._lock:
+                if time.monotonic() - arrival > 0.25:
+                    stats['processing_expired'] += 1
+                    return
+            rgb = decode_rgb(msg)
+            images = {key: cv2.resize(rgb, (self.img_size, self.img_size),
+                                     interpolation=cv2.INTER_AREA)}
+            if key == 'cam_main' and self.main_roi_spec:
+                images['cam_main'] = crop_roi(rgb, self.main_roi_spec, self.img_size)
+            if key == 'cam_main' and self.roi_spec:
+                images['cam_main_roi'] = crop_roi(rgb, self.roi_spec, self.img_size)
+        except Exception as exc:
+            with self._lock:
+                stats['errors'] += 1
+                stats['valid'] = False
+                stats['last_error'] = str(exc)
+                errors = stats['errors']
+            if errors == 1 or errors % 30 == 0:
+                self.node.get_logger().error(f'[{key}] rejected frames={errors}: {exc}')
             return
         with self._lock:
-            self._images[key] = img
+            delay = time.monotonic() - arrival
+            stats['processing_delay_s'] = delay
+            if delay > 0.25:
+                stats['processing_expired'] += 1
+                return
+            if stats['arrival']:
+                stats['max_gap_s'] = max(stats['max_gap_s'], arrival - stats['arrival'])
+            else:
+                stats['first_arrival'] = arrival
+            stats.update(arrival=arrival, source_stamp_ns=stamp, valid=True,
+                         accepted=stats['accepted'] + 1, last_error='')
+            self._images.update(images)  # full view and ROI become visible atomically
+
+    def _quality_locked(self, max_age=0.25, max_skew=0.15):
+        now = time.monotonic()
+        cameras = {}
+        problems = []
+        for key, stats in self._camera_stats.items():
+            age = now - stats['arrival'] if stats['arrival'] else None
+            elapsed = now - stats['first_arrival'] if stats['first_arrival'] else 0
+            cameras[key] = {**stats, 'age_s': age,
+                            'fps': (stats['accepted'] - 1) / elapsed if elapsed > 0 else 0}
+            if not stats['valid'] or age is None or age > max_age:
+                problems.append(f'{key}: missing/invalid/stale ({age})')
+        stamps = [v['source_stamp_ns'] for v in self._camera_stats.values()]
+        skew = (max(stamps) - min(stamps)) / 1e9
+        warnings = []
+        if all(stamps) and skew > max_skew:
+            warnings.append(f'camera skew {skew:.3f}s')
+        for name, stamp in [('follower', self._joint_stamp), ('leader', self._leader_stamp)]:
+            if not stamp or now - stamp > max_age:
+                problems.append(f'{name}: stale joint feedback')
+        return {'ok': not problems, 'problems': problems, 'cameras': cameras,
+                'camera_skew_s': skew, 'max_camera_skew_s': max_skew,
+                'warnings': warnings, 'camera_sync_required': False,
+                'image_quality_policy': 'latest_per_camera_age_v2'}
+
+    def observation_quality(self):
+        with self._lock:
+            return self._quality_locked()
+
+    def last_observation_quality(self):
+        with self._lock:
+            return self._last_obs_quality
 
     # ================= 读取缓存 =================
     @property
@@ -606,12 +694,13 @@ class SO101Env(gym.Env):
             pos = self._joint_pos
             vel = self._joint_vel
             imgs = dict(self._images)
+            self._last_obs_quality = self._quality_locked()
         if pos is None:
             pos = np.zeros(6, dtype=np.float32)
         if vel is None:
             vel = np.zeros(6, dtype=np.float32)
         images = {}
-        for cam in ('cam_main', 'cam_wrist'):
+        for cam in self.image_keys:
             images[cam] = imgs.get(cam, np.zeros((self.img_size, self.img_size, 3), np.uint8))
         if self.display_image:
             try:
@@ -620,8 +709,15 @@ class SO101Env(gym.Env):
                 cv2.waitKey(1)
             except Exception:
                 pass
+        idx=list(CONTROLLED_IDX)
+        command_error=np.zeros(N_ACTION,np.float32)
+        hold_offset=np.zeros(N_ACTION,np.float32)
+        if self._command_hold.command is not None:
+            command_error=(self._command_hold.target()[idx]-pos[idx]).astype(np.float32)
+            hold_offset=self._command_hold.offset[idx].astype(np.float32)
         return {
-            'state': {'joint_pos': pos.astype(np.float32), 'joint_vel': vel.astype(np.float32)},
+            'state': {'joint_pos': pos.astype(np.float32), 'joint_vel': vel.astype(np.float32),
+                      'command_error': command_error, 'hold_offset': hold_offset},
             'images': images,
         }
 
@@ -659,14 +755,23 @@ class SO101Env(gym.Env):
         if not cli.service_is_ready():
             cli.wait_for_service(timeout_sec=timeout)
         if not cli.service_is_ready():
+            self.node.get_logger().error(f'Torque service unavailable: {cli.srv_name}')
             return False
         req = SetBool.Request()
         req.data = bool(value)
         fut = cli.call_async(req)
-        t0 = time.time()
-        while not fut.done() and time.time() - t0 < timeout:
+        t0 = time.monotonic()
+        while not fut.done() and time.monotonic() - t0 < timeout:
             time.sleep(0.02)
-        return bool(fut.done() and fut.result() is not None and fut.result().success)
+        if not fut.done():
+            self.node.get_logger().error(f'Torque service timed out: {cli.srv_name}')
+            return False
+        result = fut.result()
+        if result is None or not result.success:
+            self.node.get_logger().error(
+                f'Torque service rejected: {cli.srv_name}: {getattr(result, "message", "no response")}')
+            return False
+        return True
 
     def set_leader_torque(self, on: bool) -> bool:
         return self._call_bool(self.leader_torque_cli, on)
@@ -716,7 +821,10 @@ class SO101Env(gym.Env):
 
         时长按 min-jerk 峰值速度反推（峰值 = 1.875 × 位移 / 时长）。
         """
-        q_to = np.asarray(q_to, dtype=float).reshape(-1)[:N_ARM]
+        q_to = np.asarray(q_to, dtype=float).reshape(-1)[:N_ARM].copy()
+        if not np.isfinite(q_to).all():
+            raise ValueError("Non-finite home target")
+        q_to = np.clip(q_to, JOINT_LOW, JOINT_HIGH)
         hold = list(FROZEN_IDX if hold_idx is None else hold_idx)
         cur = self.joint_pos
         q_from = (np.asarray(cur, dtype=float).reshape(-1)[:N_ARM].copy()
@@ -730,7 +838,10 @@ class SO101Env(gym.Env):
         if disp < 1e-6:
             self._publish_arm(q_to)
             return 0.0          # 已经在那儿了，不用动
-        dur = float(np.clip(1.875 * math.degrees(disp) / v_max_deg, d_min, d_max))
+        # Do not cap duration: a cap would violate the requested peak speed.
+        # Quintic profile peak acceleration = 5.774 * displacement / duration².
+        dur = max(d_min, 1.875 * math.degrees(disp) / v_max_deg,
+                  math.sqrt(5.774 * math.degrees(disp) / 60.0))
 
         msg = JointTrajectory()
         msg.header.stamp = self.node.get_clock().now().to_msg()
@@ -745,11 +856,38 @@ class SO101Env(gym.Env):
         self.traj_pub.publish(msg)
         return dur
 
+    def _settled_joint_position(self, motion_s=0.0):
+        """Wait for fresh, stable feedback after the planned trajectory ends."""
+        end = time.monotonic() + motion_s
+        deadline = end + max(2.0, self.start_settle_s)
+        samples = []
+        last_stamp = 0.0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            with self._lock:
+                stamp = self._joint_stamp
+                pos = None if self._joint_pos is None else self._joint_pos[:N_ARM].copy()
+            if pos is None or now - stamp > 0.25:
+                raise RuntimeError('归位反馈过期，拒绝继续归位/录制')
+            if now >= end and stamp != last_stamp:
+                last_stamp = stamp
+                samples.append((now, pos))
+                samples = [(t, q) for t, q in samples if now - t <= 0.4]
+                if len(samples) >= 4 and samples[-1][0] - samples[0][0] >= 0.3:
+                    values = np.stack([q for _, q in samples])
+                    if np.max(np.ptp(values, axis=0)) < math.radians(0.15):
+                        return np.median(values, axis=0)
+            time.sleep(0.02)
+        raise RuntimeError('归位后反馈未稳定，拒绝开始录制')
+
+    def _prepare_start_pose(self):
+        """Backend-specific reset preparation; default backend preserves roll."""
+        return None
+
     def reset(self, *, seed=None, options=None, wait_for_data: float = 5.0):
         """回到（随机化的）初始位姿并返回第一帧观测。
 
-        起点 = Phase 0 验证过的 `START_JOINT_POSE`，再只转 shoulder_pan 做
-        水平弧随机化（见 so101_home_pose.randomize_start_pose）。
+        起点 = START_JOINT_POSE，pan/lift/elbow 分别随机 ±1.5°，腕部补偿倾角。
         """
         super().reset(seed=seed)
         if seed is not None:
@@ -764,41 +902,45 @@ class SO101Env(gym.Env):
         while self.joint_pos is None and time.time() - t0 < wait_for_data:
             time.sleep(0.05)
 
-        # ★★ 起点：Phase 0 验证过的姿态 + shoulder_pan 水平弧随机化 ★★
-        #   不再用 INIT_POSE —— 那是个**占位折叠姿态**（pan=0），既不是验证过的
-        #   起点、又会把 pan 摇 19°。
-        #   ⚠️ 随机化只有 2 个方向：shoulder_pan 冻结 ⇒ 末端被锁在一个竖直平面内，
-        #      做不出水平面内的二维方形随机化（用户 2026-09-29 决定接受）。
+        if self.joint_pos is None or time.monotonic() - self._joint_stamp > 0.25:
+            raise RuntimeError('无新鲜关节反馈，拒绝归位')
+
+        roll_home_info=self._prepare_start_pose()
+
+        # 起点在名义关节姿态附近采样；不做 IK。
         q5 = np.asarray(START_JOINT_POSE, dtype=float)[:N_ARM].copy()
-        # 起点姿态 = START_JOINT_POSE（5 个臂关节全部），受控关节由随机化 IK 覆盖。
-        # ⚠️ 2026-09-29 起 pan 已解冻（在 CONTROLLED_IDX 里），所以不再需要
-        #    "把 pan 拉回名义值"那种补丁 —— IK 自己会给出合适的 pan。
-        #    wrist_roll 仍锁实测：管子轴对称，它的值对任务没有意义，不动更稳。
+        # wrist_roll 使用实测值，归位不改变冻结维度。
         if self.joint_pos is not None:
             q5[4] = float(self.joint_pos[4])
-        start_info = {'randomized': False}
+        # Displacements describe the selected target relative to the nominal
+        # start, not the measured reset residual. Fixed/fallback starts are zero.
+        start_info = {'randomized': False, 'dx_m': 0.0, 'dy_m': 0.0, 'dz_m': 0.0,
+                      'randomization_mode': 'fixed', 'joint_delta_deg': [0.0] * N_ARM,
+                      'joint_half_deg': self.randomize_joint_half_deg}
         if self.randomize_start:
-            q_rand, info = randomize_start_pose(
-                self._rng, half_m=self.randomize_half_m,
+            q_rand, info = randomize_joint_start_pose(
+                self._rng, half_deg=self.randomize_joint_half_deg,
                 q_cur=self.joint_pos, kin=self._kin)
             if info.get('ok'):
-                q5[list(CONTROLLED_IDX)] = np.asarray(q_rand)[list(CONTROLLED_IDX)]
+                q5[:4] = np.asarray(q_rand)[:4]
                 start_info = {'randomized': True, **{
                     k: info[k] for k in ('dx_m', 'dy_m', 'dz_m', 'err_mm',
                                          'tube_angle_deg', 'd_tilt_deg',
-                                         'margin_rad', 'iters')
+                                         'margin_rad', 'iters', 'randomization_mode',
+                                         'joint_half_deg', 'joint_delta_deg')
                 }}
             else:
-                # ★ 绝不把没通过复核的解下发 —— 退回名义起点，并把原因打出来。
-                #   不是"以防万一"：IK 在框边界上确实会差一点，
-                #   下发一个姿态错的目标比"这次不随机"糟糕得多。
+                # 不下发越界或倾角不合格的随机目标，记录回退原因。
                 self.node.get_logger().warn(
                     f'起始位置随机化未通过复核，本次退回名义起点：{info.get("reason")}')
-                start_info = {'randomized': False, 'reason': info.get('reason')}
+                start_info['reason'] = info.get('reason')
         self.last_start_info = start_info
+        start_info['wrist_roll_home'] = roll_home_info
+        start_info['target_tilt_deg'] = tube_tilt_deg(q5)
+        start_info['frozen_wrist_roll_deg'] = math.degrees(q5[4])
         if start_info['randomized']:
             self.node.get_logger().info(
-                f'起始位置随机化：dx {start_info["dx_m"]*100:+.2f}cm / '
+                f'起始关节随机化 {start_info["joint_delta_deg"][:3]}°；dx {start_info["dx_m"]*100:+.2f}cm / '
                 f'dy {start_info["dy_m"]*100:+.2f}cm / '
                 f'dz {start_info["dz_m"]*100:+.2f}cm，'
                 f'管子距竖直 {start_info["tube_angle_deg"]:.3f}°，'
@@ -807,7 +949,8 @@ class SO101Env(gym.Env):
         # ★ 重力静差补偿：q5 是希望手臂**实际**停在的姿态，而舵机是比例环、
         #   发什么就停在什么下方几度。所以下发的**指令**要加上归位脚本收敛出来的
         #   那个偏置。冻结维度的偏置无所谓 —— _publish_arm_ramp 里会被实测值覆盖。
-        q_cmd = q5 + self.home_offset
+        q_base = np.clip(q5 + self.home_offset, JOINT_LOW, JOINT_HIGH)
+        q_cmd = q_base.copy()
 
         # ★ 不发夹爪指令：夹爪是**冻结**的，一直夹着试管。
         #   踩坑（2026-09-29 排查发现）：原代码这里发 `_send_gripper(-1.0)`，
@@ -818,7 +961,7 @@ class SO101Env(gym.Env):
 
         # 平滑走过去（不是弹过去）；冻结维度在 _publish_arm_ramp 里已锁在实测值
         dur = self._publish_arm_ramp(q_cmd, hold_idx=(4,))   # 只锁 wrist_roll
-        time.sleep(dur + self.start_settle_s)
+        q_measured = self._settled_joint_position(dur)
 
         # ★★ 实测反馈：把"实际停在哪"量回来、把残差补进指令，再走一小段 ★★
         #   为什么不能只靠固定的重力补偿：那个偏置是在**名义点**上标定的，
@@ -830,17 +973,19 @@ class SO101Env(gym.Env):
             cur = self.joint_pos
             if cur is None:
                 break
-            q_act = np.asarray(cur, dtype=float).reshape(-1)[:N_ARM]
+            q_act = q_measured
             e = q5 - q_act
-            for i in FROZEN_IDX:                     # 冻结维度不修正
+            for i in (4, 5):                     # 冻结维度不修正
                 if i < N_ARM:
                     e[i] = 0.0
             if float(np.abs(e).max()) < self.start_feedback_tol:
                 break
             e = np.clip(e, -START_FEEDBACK_MAX, START_FEEDBACK_MAX)
-            q_cmd = q_cmd + e
+            q_cmd = np.clip(q_cmd + 0.7 * e,
+                            q_base - math.radians(6), q_base + math.radians(6))
+            q_cmd = np.clip(q_cmd, JOINT_LOW, JOINT_HIGH)
             d2 = self._publish_arm_ramp(q_cmd, hold_idx=(4,))
-            time.sleep(d2 + self.start_settle_s)
+            q_measured = self._settled_joint_position(d2)
             n_fb += 1
         start_info['feedback_iters'] = n_fb
         # ★ 报出"实际停在哪 vs 目标"的残差 —— phase1_home.py 一直有这个数字，
@@ -849,7 +994,7 @@ class SO101Env(gym.Env):
         if cur is not None:
             q_act = np.asarray(cur, dtype=float).reshape(-1)[:N_ARM]
             start_info['resid_deg'] = float(
-                math.degrees(np.abs(q5 - q_act)[list(CONTROLLED_IDX)].max()))
+                math.degrees(np.abs(q5 - q_act)[:4].max()))
 
         # ★ 复核：量**实际**停在哪、管子多歪。这是"重力补偿到底对不对"的唯一
         #   现场证据。补偿为 0（没跑归位脚本）时管子会歪到 ~8.8°，这里会告警。
@@ -859,156 +1004,114 @@ class SO101Env(gym.Env):
             start_info['act_tilt_deg'] = tube_tilt_deg(q_act)
             start_info['act_z_cm'] = tool_z(q_act) * 100.0
             if start_info['act_tilt_deg'] > 3.0:
-                self.node.get_logger().warn(
-                    f'起始姿态管子歪了 {start_info["act_tilt_deg"]:.2f}°'
-                    f'（名义起点是 1.66°），末端 z={start_info["act_z_cm"]:.1f}cm —— '
-                    f'多半是**重力静差补偿没生效**。先跑一次 phase1_home.py 生成'
-                    f'归位指令存档，再重开训练。')
+                if start_info['target_tilt_deg'] > 3.0:
+                    self.node.get_logger().warn(
+                        f'当前冻结 wrist_roll={start_info["frozen_wrist_roll_deg"]:.2f}°，'
+                        f'目标模型倾角本身为 {start_info["target_tilt_deg"]:.2f}°（超过 3°）；'
+                        f'归位后模型倾角 {start_info["act_tilt_deg"]:.2f}°。'
+                        '请检查冻结关节起始姿态，不能据此判定重力补偿失效。')
+                else:
+                    self.node.get_logger().warn(
+                        f'起始模型倾角 {start_info["act_tilt_deg"]:.2f}° 超过 3°，'
+                        f'目标倾角 {start_info["target_tilt_deg"]:.2f}°；'
+                        '请检查实测关节残差、反馈和负载补偿。')
             else:
                 self.node.get_logger().info(
                     f'起始姿态：管子距竖直 {start_info["act_tilt_deg"]:.2f}°，'
                     f'末端 z={start_info["act_z_cm"]:.1f}cm')
+        residual = float(np.max(np.abs(q5 - q_measured)[:4]))
+        start_info['resid_deg'] = math.degrees(residual)
+        start_info['target_joint_rad'] = q5.tolist()
+        start_info['measured_joint_rad'] = q_measured.tolist()
+        start_info['actual_joint_delta_deg'] = np.degrees(
+            q_measured - np.asarray(START_JOINT_POSE)[:N_ARM]).tolist()
+        acceptance_tol = START_ACCEPTANCE_TOL
+        settled_tilt = tube_tilt_deg(q_measured)
+        start_info['precision_tol_deg'] = math.degrees(self.start_feedback_tol)
+        start_info['acceptance_tol_deg'] = math.degrees(acceptance_tol)
+        start_info['precision_met'] = residual <= self.start_feedback_tol
+        start_info['act_tilt_deg'] = settled_tilt
+        start_info['act_z_cm'] = tool_z(q_measured) * 100.0
+        start_info['accepted'] = (residual <= acceptance_tol + 1e-12 and settled_tilt <= 3.0)
+        start_info['accepted_outside_precision'] = (
+            start_info['accepted'] and not start_info['precision_met'])
+        if not start_info['accepted']:
+            raise RuntimeError(f'归位未通过验收: residual={math.degrees(residual):.2f}°, '
+                               f'limit={math.degrees(acceptance_tol):.3f}°, '
+                               f'tilt={settled_tilt:.2f}°（上限 3.00°）；'
+                               f'target_tilt={start_info["target_tilt_deg"]:.2f}°, '
+                               f'frozen_roll={start_info["frozen_wrist_roll_deg"]:.2f}°；'
+                               '请检查目标姿态、冻结关节、归位反馈与补偿')
+        if start_info['accepted_outside_precision']:
+            self.node.get_logger().warn(
+                f'归位稳定，在放宽后的验收范围内：'
+                f'残差 {math.degrees(residual):.3f}°，'
+                f'修正目标 {math.degrees(self.start_feedback_tol):.3f}°，'
+                f'验收上限 {math.degrees(acceptance_tol):.3f}°；已记录起点质量')
+        self._command_hold.calibrate(q_cmd, q_measured)
+        start_info['hold_command_rad'] = q_cmd.tolist()
+        start_info['hold_offset_rad'] = self._command_hold.offset.tolist()
         return self._get_obs(), {'succeed': False, 'start': start_info}
 
     def set_intervene_deadband(self, rad: float):
-        """设置干预判定的死区（rad）。录制前应传 0.0。
-
-        为什么录制要 0：死区只影响「info 里报不报 intervene_action」，
-        而 mode B 的从臂命令**不受它影响**。死区 0.05 rad（2.86°）比 10Hz 下
-        典型的人类单步位移还大，于是慢速操作时：手臂动了 1~2°，
-        录下来的 action 却是 0 —— `(obs, action, next_obs)` 不再自洽，
-        RLPD 的 critic 会学到一个"零动作也能让手臂动"的假世界。
-        实测首批 52 段：**81.1% 的步 action=0，其中大半手臂确实动了**。
-        """
+        """保留旧录制器接口；关节干预记录请求的归一化增量，不做死区过滤。"""
         self.intervene_deadband = float(rad)
         return self.intervene_deadband
 
-    def get_intervene_action(self, deadband: Optional[float] = None) -> Optional[np.ndarray]:
-        """若人类正在接管，返回与 policy 同语义的「专家动作」（关节增量，∈[-1,1]^3）。
-
-        返回 None 表示本步没有人类意图。
-
-        ★ 维度 = 3，与 `self.action_space` 完全一致（只含受控关节：
-          shoulder_lift / elbow_flex / wrist_flex）。冻结关节不在这里面。
-
-        语义必须与 policy 动作严格一致（都是关节增量），否则 train_rlpd 的
-        `actions = info.pop("intervene_action")` 会把两种量纲的动作混进同一个
-        buffer，critic 学出来就是坏的。
-
-        Q1 决策：以 leader 的「增量」判定，不是绝对位置。
-          原版 SpacemouseIntervention 用 `norm(expert_a) > 0.001`，
-          但 SpaceMouse 静止时输出≈0，而 leader 关节角是绝对位置（永不为 0），
-          照抄会导致「永远在干预」。
-        """
-        if not self.is_intervening:
-            self._prev_leader = self.leader_pos
-            return None
-
-        cur = self.leader_pos
-        if cur is None:
-            return None
-        prev = getattr(self, '_prev_leader', None)
-        self._prev_leader = cur
-        if prev is None:
-            return None
-
-        # ★ 死区默认值可用 set_intervene_deadband() 覆盖：
-        #   录制时必须设成 0 —— 见 set_intervene_deadband 的说明。
-        db = (getattr(self, 'intervene_deadband', DEFAULT_INTERVENE_DEADBAND)
-              if deadband is None else float(deadband))
-        delta = cur - prev
-
-        # 专家关节增量 = leader 位移 / action_scale，使其与 policy 动作同量纲
-        # ★ 维度是 **3**（只取受控关节），必须与 `self.action_space`、
-        #   以及 policy 输出的动作**逐维对齐** —— train_rlpd 的
-        #   `actions = info.pop("intervene_action")` 会把两者塞进同一个 buffer，
-        #   形状或语义对不上，critic 学出来就是坏的。
-        #   顺带消掉原先把 leader 的 gripper **弧度**当 [0,100] 用
-        #   （`(cur[5]-50)/50`，恒为 ≈ −1）那个潜在 bug 的影响。
-        expert = np.clip(joint_delta_to_action(delta[:N_ARM], self.action_scale),
-                         -1.0, 1.0).astype(np.float32)
-
-        # 死区：leader 静止时也有传感器噪声，低于阈值不算「有意干预」
-        # ★ 只在**受控关节**上判：冻结关节（pan / wrist_roll / gripper）即使被人手
-        #   推动，也产生不了任何动作（expert 恒 0），不该算成"有意干预" ——
-        #   否则会往 buffer 里塞进一批"专家动作全 0"的样本，把 critic 带偏。
-        if np.linalg.norm(delta[list(CONTROLLED_IDX)]) < db:
-            return None
-        return expert
+    def get_intervene_action(self, deadband=None):
+        """Expert and policy both store normalized requested relative joint increments."""
+        return self._last_joint_action.copy() if self.is_intervening else None
 
     def step(self, action: np.ndarray):
-        # ---- 模式切换（含力矩管理）----
-        self._enter_mode('human' if self.is_intervening else 'policy')
-
+        step_started = time.monotonic()
+        delta = bounded_joint_delta(action, self.action_scale)
         cur = self.joint_pos
-        if cur is None:
-            cur = np.zeros(6, dtype=np.float32)
-
-        # ---- 目标位姿：人类接管时 follower 跟随 leader，否则跟随 policy ----
-        # ★ 动作是 **3 维**，只作用在受控关节上（action_to_joint_delta 会把
-        #   它散射到 5 关节增量里，冻结维恒 0）。
-        # ★ 夹爪不在动作空间里：本任务夹爪一直夹着试管，reset() 闭合到位后
-        #   step() **不再发任何夹爪指令**。（将来若要放开夹爪，需同时把
-        #   'gripper' 移出 FROZEN_JOINTS 并在这里恢复 _send_gripper。）
+        if cur is None or not np.all(np.isfinite(cur)) or time.monotonic() - self._joint_stamp > .25:
+            raise RuntimeError('No fresh joint feedback; refusing step')
+        target5 = self._command_hold.target()
+        self._enter_mode('human' if self.is_intervening else 'policy')
+        idx=list(CONTROLLED_IDX)
+        source_problem=None
+        human_goal=None
+        reference=target5-self._command_hold.offset
         if self.is_intervening:
-            # 模式 B：follower 跟随 leader 的**变化量**（差分映射）
-            #
-            #   target5 = 接管瞬间的从臂位置 + (主臂当前位置 − 接管瞬间的主臂位置)
-            #
-            # ★★ 为什么必须是差分，不能用"主臂绝对角"（2026-09-29 改）★★
-            #   原先写的是 `target5 = leader[:5] − LEADER_HOME_OFFSET`（绝对）。
-            #   那有两个后果，都会**静默地毁掉数据**：
-            #     ① reset() 刚把从臂随机化到某个起点，人手一接管，从臂立刻跳回
-            #        主臂所在的姿态 —— 随机化被当场抹掉（练习到的起点全都一样）。
-            #     ② 更隐蔽：录下来的 `intervene_action` 是"主臂位移 / action_scale"，
-            #        而 env 实际下发的是主臂的**绝对角** —— 两者根本不是一回事。
-            #        RLPD 的 transition 要求 (obs, action, next_obs) 自洽
-            #        （"在 obs 施加 action 得到 next_obs"），绝对映射下这个等式不成立，
-            #        critic 学到的东西是自相矛盾的。
-            #   改成差分后：从臂位移 == 主臂位移 == action × action_scale ✓ 自洽。
-            #   顺带也不需要再显式减 LEADER_HOME_OFFSET 了 —— 主臂的家偏置
-            #   在 `主臂当前位置 − 主臂基准` 里自动抵消。
-            led = self.leader_pos
-            if led is not None and self._lead_anchor is not None:
-                target5 = (self._foll_anchor + (np.asarray(led, float)[:N_ARM]
-                                            - self._lead_anchor)
-                       + self.home_offset)
-            elif led is not None:
-                # 基准缺失（拿不到状态就接管了）—— 安全退化：保持不动
-                target5 = cur[:5].copy() + self.home_offset
+            leader=self.leader_pos
+            if leader is None or not np.all(np.isfinite(leader)) or time.monotonic()-self._leader_stamp>.25:
+                source_problem='stale_leader';delta=np.zeros(N_ACTION)
+            elif self._lead_anchor is None or self._foll_anchor is None:
+                source_problem='missing_human_anchor';delta=np.zeros(N_ACTION)
             else:
-                target5 = (cur[:5] + action_to_joint_delta(action, self.action_scale)
-                           + self.home_offset)
-        else:
-            # 模式 A：policy 控制。关节增量以**实测位置**为基准（避免累积漂移）
-            #
-            # ★★ 必须再加 `home_offset`（重力静差补偿）★★
-            #   不加会怎样（2026-09-29 真机现象，用户报的"复位不准 / 接管时从臂
-            #   会变一下"）：
-            #     模式 A 的指令 = 实测位置 → 舵机的比例误差为 0 → **没有顶重力的力**
-            #     → 手臂一路缓慢下垂。而接管瞬间模式 B 的指令是**冻结住的**
-            #     `foll_anchor + home_offset`，比已经垂下去的位置高 → 从臂"弹回去一下"。
-            #   加上这个偏置后：模式 A 停在指令附近（不再漂），接管时
-            #   `foll_anchor + home_offset` 与模式 A 的指令**恰好连续** → 零跳变。
-            #   这正是用户提的"把固定时候的那个作为一个残差项"。
-            target5 = (cur[:5] + action_to_joint_delta(action, self.action_scale)
-                       + self.home_offset)
-
-        target5 = np.clip(target5, JOINT_LOW, JOINT_HIGH)
-
-        # ★ 冻结维度兜底：指令 = **实测值**，也就是"根本不命令它"。
-        #   模式 A 下 action_to_joint_delta 已经保证冻结维为 0，这一步是冗余的；
-        #   但模式 B 的目标来自主臂（含 pan/wrist_roll），**必须**过这一道。
-        #   用实测值而不是固定目标角：零回复力、永不跳变。
+                desired=self._foll_anchor+(np.asarray(leader)[:N_ARM]-self._lead_anchor)
+                human_goal=desired[idx].tolist()
+                delta=desired[idx]-reference[idx]  # Shared executor clips both expert and policy requests.
+        request=delta/self.action_scale if self.is_intervening else np.asarray(action,float)
+        low=getattr(self,'_action_low',JOINT_LOW[idx])
+        high=getattr(self,'_action_high',JOINT_HIGH[idx])
+        candidate,status=execute_joint_request(target5[idx],cur[idx],self._command_hold.offset[idx],
+            request,low,high,self.action_scale)
+        target5[idx]=candidate
+        self._last_joint_action=np.asarray(status['requested_action'],np.float32)
+        status['source']='human' if self.is_intervening else 'policy'
+        status['step_started_monotonic_s']=step_started
+        status['leader_feedback_monotonic_s']=self._leader_stamp
+        status['follower_feedback_monotonic_s']=self._joint_stamp
+        if human_goal is not None:status['human_goal_geometric_rad']=human_goal
+        if source_problem:status.update(accepted=False,reason=source_problem)
+        self._joint_control_status=status
+        if source_problem or status['limited']:
+            now=time.monotonic()
+            if now-getattr(self,'_last_joint_warning',0.)>=1.:
+                self.node.get_logger().warn(f'关节控制受限：{source_problem or status["joint_reasons"]}')
+                self._last_joint_warning=now
         target5 = hold_frozen(target5, cur)
         self._publish_arm(target5)
-
-        # 模式 A 下让 leader 跟随 follower（有手感反馈）
+        status['published_monotonic_s']=time.monotonic()
+        self._command_hold.remember(target5)
         if not self.is_intervening:
             self._drive_leader(cur)
 
         # 维持控制周期
-        time.sleep(1.0 / self.hz)
+        time.sleep(max(0., 1.0 / self.hz - (time.monotonic() - step_started)))
 
         obs = self._get_obs()
         reward = self.compute_reward(obs)
@@ -1016,7 +1119,10 @@ class SO101Env(gym.Env):
         self._episode_return += reward
         done = self._step_count >= self.max_episode_steps or reward == 1
 
-        info = {'succeed': bool(reward), 'intervening': self.is_intervening}
+        info = {'succeed': bool(reward), 'intervening': self.is_intervening,
+                'observation_quality': self.last_observation_quality(),
+                'joint_control': self._joint_control_status}
+        status['step_finished_monotonic_s']=time.monotonic()
         expert = self.get_intervene_action(self.intervene_deadband)
         if expert is not None:
             info['intervene_action'] = expert      # ← RLPD 靠这个字段
@@ -1054,6 +1160,8 @@ class SO101Env(gym.Env):
             self._spin_thread.join(timeout=2.0)
         except Exception:
             pass
+        for worker in getattr(self, '_image_workers', {}).values():
+            worker.close()
         try:
             self.node.destroy_node()
         except Exception:

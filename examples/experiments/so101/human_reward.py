@@ -1,0 +1,63 @@
+"""Episode-level human rewards. No robot, ROS or learned reward dependencies."""
+import copy
+import hashlib
+import json
+from pathlib import Path
+import numpy as np
+
+
+def load_episode(path, config, allow_provisional=False):
+    import pickle
+    path = Path(path)
+    label_path = path.with_suffix('.labels.json')
+    labels = json.loads(label_path.read_text())
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if labels.get('recording_sha256') != digest:
+        raise ValueError(f'{path.name}: missing/mismatched recording hash; review labels again')
+    lab = labels['episodes']['0']
+    if lab.get('provisional', False):
+        if not allow_provisional:
+            raise ValueError('Provisional label requires --allow-provisional')
+    elif not lab.get('reviewed', False) or lab.get('source') != 'human_review':
+        raise ValueError('Human review required')
+    if lab.get('status') not in ('success', 'failed'):
+        raise ValueError('Episode must be explicitly labeled success or failed')
+    with path.open('rb') as f:
+        raw = pickle.load(f)  # Only trusted, user-owned recording files.
+    meta, ts = raw['meta'], raw['transitions']
+    if meta.get('operator_excluded') or meta.get('recording', {}).get('has_gaps'):
+        raise ValueError('Excluded episode or missing recording steps')
+    expected = dict(action_semantics=config.ACTION_SEMANTICS,
+                    observation_semantics=config.OBSERVATION_SEMANTICS,
+                    action_scale_rad=config.ACTION_SCALE, action_joints=config.ACTION_JOINTS,
+                    env_hz=config.ENV_HZ, control_backend=config.CONTROL_BACKEND,
+                    pose_alignment=config.POSE_ALIGNMENT, roi_spec=config.roi_spec,
+                    main_roi_spec=config.main_roi_spec)
+    for key, val in expected.items():
+        if meta.get(key) != val:
+            raise ValueError(f'{path.name}: incompatible {key}')
+    success = lab['status'] == 'success'
+    end = lab.get('frame') if success else len(ts)
+    if isinstance(end, bool) or not isinstance(end, int) or not 1 <= end <= len(ts):
+        raise ValueError('Success observation frame must be in 1..N')
+    env = config.get_environment(fake_env=True)
+    result = []
+    for i, raw_t in enumerate(ts[:end]):
+        for field in ('observations', 'next_observations'):
+            obs = raw_t[field]
+            if set(obs) != set(env.observation_space.spaces):
+                raise ValueError('Observation keys mismatch')
+            for key, space in env.observation_space.spaces.items():
+                a = np.asarray(obs[key])
+                if a.shape != space.shape or a.dtype != space.dtype or not np.isfinite(a).all():
+                    raise ValueError(f'Invalid {field}/{key}')
+        if not env.action_space.contains(raw_t['actions']):
+            raise ValueError('Invalid action')
+        t = {key: raw_t[key] for key in ('observations', 'actions', 'next_observations')}
+        final = i == end - 1
+        t.update(rewards=np.float32(success and final), masks=np.float32(not final), dones=final)
+        result.append(t)
+    receipt = dict(id=hashlib.sha256((digest + json.dumps(lab, sort_keys=True)).encode()).hexdigest(),
+                   recording_sha256=digest, file=path.name, label=copy.deepcopy(lab),
+                   transitions=len(result), quality_flagged=sum(not t.get('infos', {}).get('quality_ok', True) for t in ts[:end]))
+    return result, receipt

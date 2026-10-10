@@ -44,6 +44,7 @@ NOTE: on this machine the X server is only reachable via the unix socket, so
       built with GUI: NONE, so cv2.imshow is unusable -- hence tkinter.
 """
 import argparse
+import hashlib
 import glob
 import json
 import math
@@ -102,7 +103,14 @@ def _ep_from_transitions(trs):
         frames['states'].append(st)
         frames['actions'].append(np.asarray(t.get('actions', []), dtype=float).reshape(-1))
         frames['intervening'].append(bool(info.get('intervening', False)))
-    T = len(trs)
+    if trs:
+        final = trs[-1]['next_observations']
+        for k in cams:
+            cams[k].append(_squeeze(final[k]))
+        frames['states'].append(_squeeze(final.get('state')))
+        frames['actions'].append(np.zeros_like(frames['actions'][-1]))
+        frames['intervening'].append(False)
+    T = len(trs) + bool(trs)
     for k in cams:
         frames[k] = cams[k]
     frames['n'] = T
@@ -202,7 +210,7 @@ class Labeler:
         mid.pack(padx=8)
         self.canv = {}
         self.rect = {}
-        for col, key in enumerate(('cam_main', 'cam_wrist')):
+        for col, key in enumerate(('cam_main', 'cam_wrist', 'cam_main_roi')):
             box = tk.Frame(mid, bg=BG)
             box.grid(row=0, column=col, padx=4)
             tk.Label(box, text=key, bg=BG, fg=FG,
@@ -214,7 +222,7 @@ class Labeler:
             self.rect[key] = c.create_rectangle(0, 0, 0, 0, outline=ACCENT, width=2)
 
         zbox = tk.Frame(mid, bg=BG)
-        zbox.grid(row=0, column=2, padx=(12, 4))
+        zbox.grid(row=0, column=3, padx=(12, 4))
         self.lbl_zoom = tk.Label(zbox, text='MAGNIFIER', bg=BG, fg=ACCENT,
                                  font=('DejaVu Sans Mono', 10))
         self.lbl_zoom.pack()
@@ -294,7 +302,7 @@ class Labeler:
                       ('w', self._save),
                       ('q', self._quit)):
             r.bind(k, lambda e, fn=fn: fn())
-        for key in ('cam_main', 'cam_wrist'):
+        for key in ('cam_main', 'cam_wrist', 'cam_main_roi'):
             c = self.canv[key]
             c.bind('<Button-1>', lambda e, k=key: self._pick(k, e))
             c.bind('<B1-Motion>', lambda e, k=key: self._pick(k, e))
@@ -304,6 +312,8 @@ class Labeler:
     def _load_current_file(self):
         path = self.paths[self.fi]
         self.episodes, self.meta = load_recording(path)
+        with open(path, 'rb') as source:
+            self.recording_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
         self.labels = {}
         lp = self._labels_path(path)
         if os.path.exists(lp):
@@ -338,7 +348,7 @@ class Labeler:
     def _src_key(self):
         if self.zoom_src and self.zoom_src in self._cur():
             return self.zoom_src
-        for k in ('cam_wrist', 'cam_main'):
+        for k in ('cam_wrist', 'cam_main', 'cam_main_roi'):
             if k in self._cur():
                 return k
         return None
@@ -381,7 +391,7 @@ class Labeler:
 
     def _draw_roi(self):
         """Draw the magnifier ROI box on both source views."""
-        for key in ('cam_main', 'cam_wrist'):
+        for key in ('cam_main', 'cam_wrist', 'cam_main_roi'):
             if key not in self._cur():
                 continue
             side = self._src_dim()
@@ -424,7 +434,7 @@ class Labeler:
                  f'{"nearest" if self.nearest else "bilinear"}')
 
     def _refresh(self):
-        for key in ('cam_main', 'cam_wrist'):
+        for key in ('cam_main', 'cam_wrist', 'cam_main_roi'):
             if key in self._cur():
                 self._draw_src(key)
         self._draw_roi()
@@ -440,6 +450,9 @@ class Labeler:
             stxt, scol = 'FAILED', ERR
         else:
             stxt, scol = '- unlabeled', WARN
+        if lab.get('provisional', False):
+            stxt += ' [PROVISIONAL - review required]'
+            scol = WARN
         n_ok = sum(1 for v in self.labels.values() if v.get('status') == 'success')
         n_bad = sum(1 for v in self.labels.values() if v.get('status') == 'failed')
         self.lbl_file.config(
@@ -454,7 +467,7 @@ class Labeler:
         stt = ep['states'][self.fr] if self.fr < len(ep['states']) else None
         jp = ''
         if stt is not None and stt.size >= 6:
-            jp = ' '.join(f'{math.degrees(v):+6.1f}°' for v in stt[:6])
+            jp = ' '.join(f'{math.degrees(v):+6.1f}°' for v in (stt[6:12] if stt.size == 18 else stt[8:14] if stt.size == 20 else stt[:6]))
         itv = ep['intervening'][self.fr] if self.fr < len(ep['intervening']) else False
         play = 'PLAYING' if self.playing else 'paused'
         note = self.meta.get('note') or ''
@@ -537,14 +550,17 @@ class Labeler:
             self.playing = False
 
     def _mark_success(self):
-        self.labels[self.ep] = {'status': 'success', 'frame': int(self.fr)}
+        if self.fr < 1:
+            print('请选择 frame >= 1：第 0 帧之前没有可赋奖励的动作。')
+            return
+        self.labels[self.ep] = {'status': 'success', 'frame': int(self.fr), 'provisional': False, 'reviewed': True, 'source': 'human_review'}
         self._refresh()
         # 无条件尝试前进 —— 一段一个文件时也要能自动跳到**下一个文件**的第一段，
         # 否则标完还得手按 n，30 段会疯。
         self._step_ep(+1)
 
     def _mark_failed(self):
-        self.labels[self.ep] = {'status': 'failed'}
+        self.labels[self.ep] = {'status': 'failed', 'provisional': False, 'reviewed': True, 'source': 'human_review'}
         self._refresh()
         self._step_ep(+1)
 
@@ -558,7 +574,7 @@ class Labeler:
         self._draw_zoom()
 
     def _toggle_src(self):
-        keys = [k for k in ('cam_main', 'cam_wrist') if k in self._cur()]
+        keys = [k for k in ('cam_main', 'cam_wrist', 'cam_main_roi') if k in self._cur()]
         if len(keys) < 2:
             return
         cur = self._src_key()
@@ -593,6 +609,7 @@ class Labeler:
         path = self.paths[self.fi]
         out = {
             'recording': os.path.abspath(path),
+            'recording_sha256': self.recording_sha256,
             'labeled_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             'n_episodes': len(self.episodes),
             'episodes': {str(k): v for k, v in sorted(self.labels.items())},

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "camera": "cam_main",
+  "source_topic": "/follower/cam_main/image_raw",
+  "source_size": [
+    640,
+    480
+  ],
+  "xyxy": [
+    291,
+    300,
+    466,
+    480
+  ],
+  "preprocess": "letterbox_rgb_v1"
+}

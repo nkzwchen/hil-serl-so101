@@ -195,6 +195,8 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
             )
             if 'grasp_penalty' in info:
                 transition['grasp_penalty']= info['grasp_penalty']
+            if 'joint_control' in info:
+                transition['infos']={'joint_control':copy.deepcopy(info['joint_control'])}
             data_store.insert(transition)
             transitions.append(copy.deepcopy(transition))
             if already_intervened:
@@ -366,6 +368,8 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
 
 
 def main(_):
+    if FLAGS.exp_name == 'so101':
+        raise RuntimeError('SO101 requires human episode rewards: use so101_tools/train_human.py')
     global config
     config = CONFIG_MAPPING[FLAGS.exp_name]()
 

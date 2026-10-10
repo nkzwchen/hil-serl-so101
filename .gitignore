@@ -38,3 +38,6 @@ l1_feel_test.log
 .vscode/
 .idea/
 .DS_Store
+
+training_runs/
+*.rrd

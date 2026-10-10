@@ -22,37 +22,15 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
 
-# ─── 路径自解析（自动生成，勿手改：见 pack_so101_tools.py）───────────────
-# 让脚本在两种布局下都能跑：
-#   A) pi_project 布局： <P>/脚本.py              + <P>/hil-serl/examples/...
-#   B) 仓库布局：       <repo>/so101_tools/脚本.py + <repo>/examples/...
-import os as _os
-import sys as _sys
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
-
-
-def _resolve_dirs():
-    for _b in (_HERE, _os.path.dirname(_HERE)):
-        if _os.path.isdir(_os.path.join(_b, 'examples', 'experiments')):
-            return _b, _os.path.join(_b, 'examples')
-        if _os.path.isdir(_os.path.join(_b, 'hil-serl', 'examples', 'experiments')):
-            return _b, _os.path.join(_b, 'hil-serl', 'examples')
-    _up = _os.path.dirname(_HERE)
-    return _up, _os.path.join(_up, 'examples')
-
-
-_ROOT, _EX = _resolve_dirs()
-_EXPERIMENTS_DIR = _os.path.join(_EX, 'experiments')
-_SO101_DIR = _os.path.join(_EXPERIMENTS_DIR, 'so101')
-_sys.path.insert(0, _SO101_DIR)
-_sys.path.insert(0, _EXPERIMENTS_DIR)
-_sys.path.insert(0, _EX)
-_sys.path.insert(0, _ROOT)
-# ─────────────────────────────────────────────────────────────────────────
+sys.path.insert(0, '/home/nkzwchen/pi_project')
+sys.path.insert(0, '/home/nkzwchen/pi_project/hil-serl/examples')
+sys.path.insert(0, '/home/nkzwchen/pi_project/hil-serl/examples/experiments')
+sys.path.insert(0, '/home/nkzwchen/pi_project/hil-serl/examples/experiments/so101')
 
 import record_demo_so101 as R  # noqa: E402
 from so101_home_pose import N_ACTION, N_ARM, START_JOINT_POSE  # noqa: E402
@@ -92,8 +70,10 @@ class StubEnv(gym.Env):
     """
 
     def __init__(self, **kw):
-        self.hz = 10.0
-        self.action_scale = 0.05
+        self.leader_torque_cli = SimpleNamespace(service_is_ready=lambda: True, wait_for_service=lambda **_: True)
+        self.follower_torque_cli = SimpleNamespace(service_is_ready=lambda: True, wait_for_service=lambda **_: True)
+        self.hz = float(kw.get("hz",30.0))
+        self.action_scale = float(kw.get("action_scale",np.radians(4.)))
         # 与真 SO101Env 同构：步数预算用**独立计数器**、且 reset() 清零。
         # （原来用 `n_steps % max_episode_steps` 的全局计数 + 6 步预算，
         #   桩会在任意位置自己结束，跟真 env 的行为不一样，测不出真问题。）
@@ -137,15 +117,27 @@ class StubEnv(gym.Env):
         self.intervene_deadband = float(rad)
         return self.intervene_deadband
 
+    def observation_quality(self):
+        return {'ok': True, 'problems': [], 'cameras': {
+            k: {'source_stamp_ns': self._tick, 'errors': 0, 'age_s': 0.,
+                'arrival': time.monotonic(), 'fps': 30.}
+            for k in ('cam_main', 'cam_wrist')}}
+
+    def last_observation_quality(self):
+        return self._last_quality
+
     def _get_obs(self):
+        self._joint_stamp = self._leader_stamp = time.monotonic()
         self._tick += 1
+        self._last_quality = self.observation_quality()
         # 图像必须**每帧都变**，否则前置检查会判"相机卡死"。
         # ★ 返回**嵌套**形态、图像**不带**前导维 —— 与真 SO101Env 一致；
         #   拍平和加前导维是 SERLObsWrapper/ChunkingWrapper 的事。
         base = np.full((IMG, IMG, 3), self._tick % 251, dtype=np.uint8)
         self._images = {'cam_main': base.copy(), 'cam_wrist': (base + 7).copy()}
         return {'state': {'joint_pos': self.joint_pos.copy(),
-                          'joint_vel': np.zeros(N_ARM + 1, dtype=np.float32)},
+                          'joint_vel': np.zeros(N_ARM + 1, dtype=np.float32),
+                          'command_error':np.zeros(N_ACTION,np.float32), 'hold_offset':np.zeros(N_ACTION,np.float32)},
                 'images': {k: v.copy() for k, v in self._images.items()}}
 
     def reset(self, seed=None, **kw):
@@ -173,7 +165,9 @@ class StubEnv(gym.Env):
         if self._intervening:
             info['intervene_action'] = np.linspace(
                 0.1, -0.2, N_ACTION).astype(np.float32)
-        return self._get_obs(), 0.0, done, False, info
+        obs = self._get_obs()
+        info['observation_quality'] = self.last_observation_quality()
+        return obs, 0.0, done, False, info
 
     def close(self):
         self._stop.set()
@@ -189,7 +183,9 @@ def _obs_space():
     return gym.spaces.Dict({
         'state': gym.spaces.Dict({
             'joint_pos': gym.spaces.Box(-np.pi, np.pi, (6,), dtype=f32),
-            'joint_vel': gym.spaces.Box(-np.inf, np.inf, (6,), dtype=f32)}),
+            'joint_vel': gym.spaces.Box(-np.inf, np.inf, (6,), dtype=f32),
+            'command_error':gym.spaces.Box(-np.inf,np.inf,(N_ACTION,),dtype=f32),
+            'hold_offset':gym.spaces.Box(-np.inf,np.inf,(N_ACTION,),dtype=f32)}),
         'images': gym.spaces.Dict({
             'cam_main': gym.spaces.Box(0, 255, (IMG, IMG, 3), dtype=np.uint8),
             'cam_wrist': gym.spaces.Box(0, 255, (IMG, IMG, 3), dtype=np.uint8)}),
@@ -252,7 +248,7 @@ class StubKeys:
 
 
 # ----------------------------------------------------------------- the test
-def main():
+def main(inject_camera_failure=False, inject_repeat=False, inject_safety_error=False, mark_short=False, inject_control_limit=False):
     tmp = tempfile.mkdtemp(prefix='recflow_')
     # 2 段：每段  c(开始) -> [env 自己 done] -> c(回程结束) -> ... ；最后 q 退出
     # 注意 RECORD 里第 3 步会按 d 提前结束
@@ -269,8 +265,48 @@ def main():
     #   `experiments.so101.env.SO101Env` 没用（config 在 import 时就绑定了）。
     import experiments.so101.env as envmod
     import experiments.so101.config as cfgmod
-    envmod.SO101Env = StubEnv
-    cfgmod.SO101Env = StubEnv
+    class FaultEnv(StubEnv):
+        def step(self, action):
+            obs, rew, done, trunc, info = super().step(action)
+            if self._intervening and self.n_resets == 1 and self._step_count == 3:
+                info['observation_quality'] = {
+                    **info['observation_quality'], 'ok': False,
+                    'problems': ['injected camera outage']}
+            return obs, rew, done, trunc, info
+
+    class RepeatEnv(StubEnv):
+        def step(self, action):
+            before = self.last_observation_quality()
+            obs, rew, done, trunc, info = super().step(action)
+            if self._intervening and self._step_count <= 2:
+                quality = {**info['observation_quality'], 'cameras': {
+                    cam: {**stats, 'source_stamp_ns': before['cameras'][cam]['source_stamp_ns']}
+                    for cam, stats in info['observation_quality']['cameras'].items()}}
+                self._last_quality = quality
+                info['observation_quality'] = quality
+            return obs, rew, done, trunc, info
+
+    class SafetyEnv(StubEnv):
+        def step(self, action):
+            if self._intervening and self._step_count == 2:
+                raise RuntimeError('injected stale joint feedback')
+            return super().step(action)
+
+    class LimitedEnv(StubEnv):
+        def step(self, action):
+            obs,rew,done,trunc,info=super().step(action)
+            if self._intervening:
+                request=info['intervene_action'].tolist()
+                info['joint_control']=dict(accepted=True,limited=True,requested_action=request,
+                    requested_delta_rad=(info['intervene_action']*.02).tolist(),
+                    applied_delta_rad=[0.]*N_ACTION,applied_action=[0.]*N_ACTION,
+                    joint_reasons=[['tracking_lag'],[],[]],held_joints=[0])
+            return obs,rew,done,trunc,info
+
+    chosen = SafetyEnv if inject_safety_error else (FaultEnv if inject_camera_failure else (RepeatEnv if inject_repeat else StubEnv))
+    if inject_control_limit:chosen=LimitedEnv
+    envmod.SO101Env = chosen
+    cfgmod.SO101Env = chosen
     R.NonBlockingKey = lambda: keys
     import rclpy
     rclpy.init = lambda *a, **k: None
@@ -278,6 +314,8 @@ def main():
 
     argv = sys.argv
     sys.argv = ['record_demo_so101.py', '--out', tmp, '--episodes', '2', '--note', 'test']
+    if mark_short:
+        sys.argv += ['--min-steps', '100']
     try:
         rc = R.main()
     finally:
@@ -292,7 +330,8 @@ def main():
 
     eps = [f for f in files if f.startswith('ep_')]
     assert 'meta.json' in files, 'meta.json 没写出来'
-    assert eps == ['ep_0000.pkl', 'ep_0001.pkl'], f'应正好两段且序号连续，实际 {eps}'
+    expected_files = ['ep_0000.pkl'] if inject_safety_error else ['ep_0000.pkl', 'ep_0001.pkl']
+    assert eps == expected_files, eps
 
     with open(os.path.join(sdir, 'meta.json'), encoding='utf-8') as f:
         meta = json.load(f)
@@ -302,16 +341,18 @@ def main():
     assert meta['keys'] == R.KEYMAP, f'键位表与 R.KEYMAP 不一致: {meta["keys"]}'
     print(f'  meta.episodes = {len(meta["episodes"])} 段   '
           f'n_attempts={meta.get("n_attempts")}  n_discarded={meta.get("n_discarded")}')
-    assert meta.get('n_discarded') == 1, '丢弃计数应为 1'
-    assert meta.get('n_attempts') == 3, '尝试次数应为 3'
+    assert meta.get('n_discarded') == 0, 'Raw attempts must not be automatically deleted'
+    assert meta.get('n_operator_excluded') == (0 if inject_safety_error else 1)
+    assert meta.get('capture_policy') == 'retain_all_with_quality_flags_v1'
+    assert meta.get('n_attempts') == (1 if inject_safety_error else 2)
     for e in meta['episodes']:
         print(f'    {e["file"]}: {e["n_steps"]} 步, 接管 {e["n_intervened"]}, '
               f'{e["hz_actual"]}Hz, 起点倾角 {e["start_tilt_deg"]}, '
               f'回程 {e.get("return", {}).get("sec")}s')
         # ★ 退段守卫必须生效：1 步的空段不能落到磁盘上
         #   （2026-09-29 首批 52 段里有 14 段就是 1 步的空段）
-        assert e['n_steps'] >= 5, \
-            f'{e["file"]} 只有 {e["n_steps"]} 步 —— 退段守卫没生效（min-steps=5）'
+        assert e['short_episode'] == (e['n_steps'] < (100 if mark_short else 5))
+
 
     # 校验第 0 段的 transition 结构（必须与 HIL-SERL 格式一致）
     with open(os.path.join(sdir, eps[0]), 'rb') as f:
@@ -323,7 +364,36 @@ def main():
               'masks', 'dones', 'infos'):
         assert k in t, f'transition 缺 {k}'
     assert t['actions'].shape == (N_ACTION,), t['actions'].shape
+    assert d['meta']['action_semantics'] == 'relative_joint_target_request_v4_3d'
+    assert d['meta']['action_scale_rad'] == cfgmod.TrainConfig.ACTION_SCALE
+    assert d['meta']['observation_semantics']=='joint_command_state_v4_3d'
+    assert d['meta']['env_hz']==cfgmod.TrainConfig.ENV_HZ
+    assert d['meta']['control_backend']==cfgmod.TrainConfig.CONTROL_BACKEND
+    assert d['meta']['pose_alignment']==cfgmod.TrainConfig.POSE_ALIGNMENT
+    assert t['observations']['state'].shape==(1,18)
+    if inject_control_limit:
+        assert d['meta']['quality_failed']
+        assert t['infos']['joint_control']['applied_delta_rad']==[0.]*N_ACTION
+        np.testing.assert_allclose(t['actions'],t['infos']['joint_control']['requested_action'])
+        assert any('joint_control' in x for x in t['infos']['quality_problems'])
+    assert d['meta']['action_joints'] == ['shoulder_pan', 'shoulder_lift', 'elbow_flex']
+    assert d['meta']['operator_excluded'] == (not inject_safety_error)
+    if inject_safety_error:
+        assert len(trs) == 2
+        assert 'injected stale joint feedback' in d['meta']['safety_error']
+    if inject_camera_failure:
+        assert d['meta']['quality_failed'] is True
+        assert d['meta']['quality_bad_steps'] >= 1
+        assert any('injected camera outage' in p for tr in trs for p in tr['infos']['quality_problems'])
+
     assert t['infos']['phase'] == 'record'
+    if inject_repeat:
+        assert t['infos']['repeated_camera_frames'], 'First fresh repeat must be retained and marked'
+        assert max(t['infos']['camera_repeat_streak'].values()) == 1
+        assert max(trs[1]['infos']['camera_repeat_streak'].values()) == 2
+        assert not trs[2]['infos']['repeated_camera_frames'], 'New frames must reset the streak'
+        assert d['meta']['max_repeated_camera_steps'] is None
+
     assert trs[-1]['dones'] is True and trs[-1]['masks'] == 0.0
     assert all(x['infos']['intervening'] for x in trs), '记录段应该全程接管'
     print(f'  actions.shape={t["actions"].shape}  dones 末尾={trs[-1]["dones"]}  '
@@ -337,5 +407,46 @@ def main():
     return 0
 
 
+def test_camera_repeat_boundaries():
+    def quality(main, wrist):
+        return {'cameras': {'cam_main': {'source_stamp_ns': main},
+                            'cam_wrist': {'source_stamp_ns': wrist}}}
+    before = quality(100, 100)
+    streaks = {}
+    for count in range(1, 20):
+        repeated, failed = R.camera_repeat_status(before, quality(100, 100 + count), streaks)
+        assert repeated == ['cam_main']
+        assert not failed
+    assert R.camera_repeat_status(before, quality(101, 101), streaks) == ([], False)
+    assert streaks == {'cam_main': 0, 'cam_wrist': 0}
+    assert R.camera_repeat_status(before, quality(99, 101), streaks)[1], 'Backwards timestamp must fail immediately'
+    print('PASS: normal reuse stays valid, new frame resets streak, backwards timestamp rejection')
+
+
+def test_missing_leader_service_blocks_preflight_before_torque():
+    from unittest.mock import patch
+    env = StubEnv()
+    torque_calls = []
+    env.leader_torque_cli = SimpleNamespace(service_is_ready=lambda: False,
+                                            wait_for_service=lambda **_: False)
+    env.set_follower_torque = lambda on: torque_calls.append(on)
+    try:
+        with patch.object(R, 'load_home_cmd', return_value={}):
+            bad, _ = R.preflight(SimpleNamespace(episodes=5, out='.', dry_run=False),
+                                 env, SimpleNamespace(ok=True))
+        assert any('/leader/set_torque' in problem for problem in bad), bad
+        assert not torque_calls, 'Missing leader service must prevent follower torque enable'
+        print('PASS: missing leader service blocks preflight before torque/reset')
+    finally:
+        env.close()
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    test_camera_repeat_boundaries()
+    test_missing_leader_service_blocks_preflight_before_torque()
+    main()
+    main(inject_camera_failure=True)
+    main(inject_repeat=True)
+    main(inject_safety_error=True)
+    main(inject_control_limit=True)
+    sys.exit(main(mark_short=True))

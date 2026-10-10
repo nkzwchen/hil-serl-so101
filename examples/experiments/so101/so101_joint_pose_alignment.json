@@ -1,0 +1,42 @@
+{
+  "version": "three_joint_pose_alignment_v1",
+  "status": "provisional_manual_three_pose_fit",
+  "units": "degrees",
+  "definition": "follower_pose = leader_pose + offset; do not add offset to each delta action",
+  "pan_correction_enabled": false,
+  "offset_deg": {
+    "shoulder_lift": 44.83087644063254,
+    "elbow_flex": -31.30742428303404,
+    "wrist_flex": -20.835164835164832
+  },
+  "max_fit_residual_deg": {
+    "shoulder_lift": 1.7668185473063502,
+    "elbow_flex": 3.0662020905923306,
+    "wrist_flex": 4.5714285714285765
+  },
+  "source": "validation/joint_relative_2026-10-09/reference_pose_pair_analysis/analysis.json",
+  "pairs": [
+    [
+      "1",
+      "1"
+    ],
+    [
+      "2",
+      "2_retry1"
+    ],
+    [
+      "3",
+      "3"
+    ]
+  ],
+  "calibration": {
+    "leader": {
+      "path": "/home/nkzwchen/.cache/huggingface/calibration/teleoperators/so_leader/so101_leader_main.json",
+      "sha256": "988301282cb671db13da3472f0cc1f7f0c1684664d1c47e5d5694e658679511f"
+    },
+    "follower": {
+      "path": "/home/nkzwchen/.cache/huggingface/calibration/robots/so_follower/so101_follower_main.json",
+      "sha256": "2bdf50022b5a89c15dbb716fb1d4ef21e8fc7ba815a017f8d97773a6e4ad97ca"
+    }
+  }
+}

@@ -67,7 +67,9 @@ from urdf_parser_py.urdf import URDF
 
 ROOT_LINK = 'base_link'
 TOOL_LINK = 'gripper_frame_link'          # URDF 自带工具参考系
-DEFAULT_URDF = '/home/nkzwchen/pi_project/so101_ros2/so101_description/urdf/so101_new_calib.urdf'
+import os
+from pathlib import Path
+DEFAULT_URDF = os.environ.get('SO101_URDF', str(Path(__file__).resolve().parents[4] / 'so101_ros2/so101_description/urdf/so101_new_calib.urdf'))
 
 
 # ----------------------------------------------------------------------------

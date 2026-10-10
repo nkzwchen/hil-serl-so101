@@ -47,40 +47,16 @@ import sys
 import time
 
 import numpy as np
+from pathlib import Path
+_REPO = Path(__file__).resolve().parents[1]
+for _directory in (_REPO / 'examples/experiments/so101', _REPO / 'examples/experiments', _REPO / 'examples'):
+    sys.path.insert(0, str(_directory))
 
 
 # --------------------------------------------------------------------- loading
 # 读盘（格式分发）与标签读取都放在 so101_recording_io —— 单一来源。
 # 以前这里自己实现了一遍，结果 label_demos 认 4 种格式、这里只认 1 种，
 # 多段文件标完却 build 不了（KeyError: 'transitions'）。
-
-# ─── 路径自解析（自动生成，勿手改：见 pack_so101_tools.py）───────────────
-# 让脚本在两种布局下都能跑：
-#   A) pi_project 布局： <P>/脚本.py              + <P>/hil-serl/examples/...
-#   B) 仓库布局：       <repo>/so101_tools/脚本.py + <repo>/examples/...
-import os as _os
-import sys as _sys
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
-
-
-def _resolve_dirs():
-    for _b in (_HERE, _os.path.dirname(_HERE)):
-        if _os.path.isdir(_os.path.join(_b, 'examples', 'experiments')):
-            return _b, _os.path.join(_b, 'examples')
-        if _os.path.isdir(_os.path.join(_b, 'hil-serl', 'examples', 'experiments')):
-            return _b, _os.path.join(_b, 'hil-serl', 'examples')
-    _up = _os.path.dirname(_HERE)
-    return _up, _os.path.join(_up, 'examples')
-
-
-_ROOT, _EX = _resolve_dirs()
-_EXPERIMENTS_DIR = _os.path.join(_EX, 'experiments')
-_SO101_DIR = _os.path.join(_EXPERIMENTS_DIR, 'so101')
-_sys.path.insert(0, _SO101_DIR)
-_sys.path.insert(0, _EXPERIMENTS_DIR)
-_sys.path.insert(0, _EX)
-_sys.path.insert(0, _ROOT)
-# ─────────────────────────────────────────────────────────────────────────
 from so101_recording_io import labels_path, load_labels, load_raw  # noqa: E402
 
 
@@ -149,7 +125,11 @@ def main():
     ap.add_argument('--allow-frame0', action='store_true',
                     help='accept a success marked on frame 0 (rewards obs_0 with no '
                          'preceding action -- usually a labelling mistake)')
+    ap.add_argument('--allow-provisional', action='store_true',
+                    help='显式允许待复核粗标签，仅用于流程验证')
     args = ap.parse_args()
+    if args.all_failed:
+        ap.error('--all-failed 已禁用：不能把未标注或未复核数据自动变成失败奖励')
 
     pairs = collect_pairs(args.recordings)
     if not pairs:
@@ -165,6 +145,10 @@ def main():
     print(f'  目标动作空间: {act_sp}')
     print()
 
+    from experiments.so101.config import TrainConfig
+    config = TrainConfig()
+    expected_roi = config.roi_spec
+    expected_main_roi = config.main_roi_spec
     kept, skipped, all_tr, all_raw = [], [], [], []
     for rec in pairs:
         fname = os.path.basename(rec)
@@ -173,6 +157,22 @@ def main():
             raw_eps, rmeta = load_raw(rec)
         except Exception as e:
             skipped.append((fname, f'读不出来：{e}'))
+            continue
+        if rmeta.get('recording', {}).get('has_gaps'):
+            skipped.append((fname, '保存队列有缺失步；须先人工复核并切分连续轨迹，禁止直接训练'))
+            continue
+        if (rmeta.get('action_semantics') != config.ACTION_SEMANTICS or
+                rmeta.get('observation_semantics') != config.OBSERVATION_SEMANTICS or
+                rmeta.get('action_scale_rad') != config.ACTION_SCALE or
+                rmeta.get('action_joints') != config.ACTION_JOINTS or
+                rmeta.get('env_hz') != config.ENV_HZ or
+                rmeta.get('control_backend') != config.CONTROL_BACKEND or
+                rmeta.get('pose_alignment') != config.POSE_ALIGNMENT):
+            skipped.append((fname, '动作/观测版本、缩放、频率、执行后端或姿态映射 与当前配置不一致；禁止混用'))
+            continue
+        if (rmeta.get('roi_spec') != expected_roi or
+                rmeta.get('main_roi_spec') != expected_main_roi):
+            skipped.append((fname, 'ROI 配置与当前训练配置不一致，拒绝混用'))
             continue
         labs = load_labels(rec)
         multi = len(raw_eps) > 1
@@ -183,6 +183,9 @@ def main():
             lab = labs.get(ei)
             if lab is None:
                 skipped.append((name, '没有标签（还没标）'))
+                continue
+            if lab.get('provisional', False) and not args.allow_provisional:
+                skipped.append((name, '粗标签待人工复核；流程验证可显式使用 --allow-provisional'))
                 continue
             if lab.get('status') != 'success':
                 skipped.append((name, f"标签是 {lab.get('status')}"))
@@ -209,6 +212,8 @@ def main():
                 t['dones'] = bool(last)
                 if 'infos' not in t or not isinstance(t['infos'], dict):
                     t['infos'] = {}
+                t['infos'] = dict(t['infos'])
+                t['infos']['reward_annotation'] = dict(lab)
                 t['infos'].pop('intervene_action', None)
 
             bad = []
@@ -263,7 +268,7 @@ def main():
         print('❌ 一条 demo 都没有产出。')
         print('   常见原因：还没标定（label_demos.py）、全标成了失败、'
               '或成功帧标在了第 0 帧。')
-        print('   如果你就是要"全失败也上传"，加 --all-failed。')
+        print('   粗标签仅供流程验证：显式添加 --allow-provisional；正式数据请先人工复核。')
         return 1
 
     n_steps = len(all_tr)

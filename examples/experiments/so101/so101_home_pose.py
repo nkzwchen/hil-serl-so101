@@ -221,23 +221,15 @@ def leader_home_offset(verbose: bool = False,
 # ★★★ 冻结的唯一正确实现：把冻结维度的指令替换成**实测值** ★★★
 #     也就是"根本不命令它"。**绝不要**写成一个固定的目标角 ——
 #     那样归位残差、机械松弛、人手碰过，都会在下一刻变成一次跳变。
-FROZEN_JOINTS = ('wrist_roll', 'gripper')
-FROZEN_IDX = tuple(JOINT_NAMES.index(j) for j in FROZEN_JOINTS)            # (4, 5)
-CONTROLLED_IDX = tuple(i for i in range(N_ALL) if i not in FROZEN_IDX)     # (0, 1, 2, 3)
+FROZEN_JOINTS = ('wrist_flex', 'wrist_roll', 'gripper')
+FROZEN_IDX = tuple(JOINT_NAMES.index(j) for j in FROZEN_JOINTS)            # (3, 4, 5)
+CONTROLLED_IDX = tuple(i for i in range(N_ALL) if i not in FROZEN_IDX)     # (0, 1, 2)
 CONTROLLED_JOINTS = tuple(JOINT_NAMES[i] for i in CONTROLLED_IDX)
 
-# ★ 动作空间的维度 = 受控关节数 = **4**
-#   动作向量的第 k 维对应 CONTROLLED_JOINTS[k]：
-#       动作[0] → shoulder_pan
-#       动作[1] → shoulder_lift
-#       动作[2] → elbow_flex
-#       动作[3] → wrist_flex
-#   冻结的 2 个关节**根本不进动作向量**，所以策略和人手在结构上就动不了它们。
-#   ⚠️ `gripper` 不在动作空间里 ⇒ HIL-SERL 的 setup_mode **必须**是
-#      'single-arm-fixed-gripper'。若用 'single-arm-learned-gripper'，
-#      那个 agent 会把**最后一维**当成夹爪（`action_dim = shape[-1] - 1`），
-#      于是 wrist_flex 会被误当成夹爪头，动作语义整个错位。
-N_ACTION = len(CONTROLLED_IDX)                                            # 4
+# 当前动作是前三个受控关节的相对角度（3 维）；不运行 Cartesian IK。
+# 训练使用无夹爪输出的连续 SAC agent。
+N_CONTROLLED = len(CONTROLLED_IDX)                                        # 3 actuated joints
+N_ACTION = N_CONTROLLED                                                  # relative joint increments
 
 
 def hold_frozen(q_cmd, q_cur):
@@ -266,8 +258,8 @@ def action_to_joint_delta(a, scale: float = 1.0):
     "跑起来不报错、但学出来是坏的"那类问题，必须当场炸掉。
     """
     a = np.asarray(a, dtype=float).reshape(-1)
-    if a.shape[0] != N_ACTION:
-        raise ValueError(f'动作维数应为 {N_ACTION}，收到 {a.shape[0]}')
+    if a.shape[0] != N_CONTROLLED:
+        raise ValueError(f'旧关节增量维数应为 {N_CONTROLLED}，收到 {a.shape[0]}')
     d = np.zeros(N_ARM, dtype=float)
     d[list(CONTROLLED_IDX)] = a * float(scale)
     return d
@@ -390,6 +382,36 @@ def start_plane_basis(kin=None, q=None):
 #
 # half_m 仍然是**米**（末端水平位移），内部按实际水平半径换算成 pan 角度。
 RANDOMIZE_HALF_M = 0.01      # 末端水平 ±1cm（此前三维框是 ±2.5cm，太大了）
+
+
+def randomize_joint_start_pose(rng, half_deg=1.5, q_cur=None, kin=None):
+    """Sample pan/lift/elbow independently; compensate wrist to retain pitch."""
+    if not math.isfinite(half_deg) or half_deg < 0:
+        raise ValueError('randomize_joint_half_deg must be finite and nonnegative')
+    q_nom = START_JOINT_POSE[:N_ARM].copy()
+    if q_cur is not None:
+        q_nom[4] = np.asarray(q_cur, dtype=float)[4]
+    k = kin if kin is not None else _kin()
+    if k is None:
+        return q_nom, {'ok': False, 'reason': 'so101_kin 不可用'}
+    delta = np.zeros(N_ARM)
+    delta[:3] = np.radians(rng.uniform(-half_deg, half_deg, 3))
+    delta[3] = -delta[1] - delta[2]
+    q = q_nom + delta
+    d0, d = k.diagnose(q_nom), k.diagnose(q)
+    displacement = k.fk(q)[0] - k.fk(q_nom)[0]
+    margin = float(np.min(np.minimum(q - Q_LOW[:N_ARM], Q_HIGH[:N_ARM] - q)))
+    valid = bool(np.all(np.isfinite(q)) and margin >= 0 and
+                 np.isfinite(d['tube_angle']) and d['tube_angle'] <= 3.0)
+    info = dict(ok=valid, dx_m=float(displacement[0]), dy_m=float(displacement[1]),
+                dz_m=float(displacement[2]), err_mm=0.,
+                tube_angle_deg=float(d['tube_angle']),
+                d_tilt_deg=float(d['tube_angle'] - d0['tube_angle']),
+                margin_rad=margin, iters=0, randomization_mode='joint_uniform_v1',
+                joint_half_deg=float(half_deg), joint_delta_deg=np.degrees(delta).tolist())
+    if not valid:
+        info['reason'] = '关节随机起点越界或倾角超过 3°'
+    return q, info
 
 
 def randomize_start_pose(rng, half_m: float = RANDOMIZE_HALF_M, q_cur=None,

@@ -202,6 +202,8 @@ def actor(agent: BCAgent, data_store, env, sampling_rng):
                 masks=1.0 - done,
                 dones=done,
             )
+            if 'joint_control' in info:
+                transition['infos']={'joint_control':copy.deepcopy(info['joint_control'])}
             if already_intervened:
                 data_store.insert(transition)
                 demo_transitions.append(copy.deepcopy(transition))
@@ -336,6 +338,8 @@ def learner(rng, agent: BCAgent, demo_buffer, wandb_logger=None):
 
 
 def main(_):
+    if FLAGS.exp_name == 'so101':
+        raise RuntimeError('SO101 requires human episode rewards: use so101_tools/train_human.py')
     global config
     config = CONFIG_MAPPING[FLAGS.exp_name]()
 

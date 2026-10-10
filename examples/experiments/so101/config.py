@@ -4,22 +4,15 @@
     get_environment / image_keys / proprio_keys / setup_mode / batch_size /
     discount / max_steps / training_starts / steps_per_update / ...
 
-前置条件（训练前必须已经在跑）：
-    · follower + leader 的桥
-    · follower 的 ros2_control（arm_controller / joint_state_broadcaster / gripper_controller）
-    · 相机（若要用图像观测）
-  这些由 so101_rl_env.launch.py 负责（F1 方案：不含 LeaderTeleopComponent，
-  因为 env 要成为 follower 的唯一控制源）。
+前置条件：只启动 so101_record_cameras.launch.py 接收图像。
+  环境通过 LeRobot 直接独占两臂串口，不能同时运行 ROS 串口桥、
+  ros2_control 或其他原生跟随进程。fake_env 不连接机器人。
 
-⚠️ 与 HIL-SERL 原始示例的差异：
-    · **动作空间只有 3 维**：`shoulder_lift / elbow_flex / wrist_flex`。
-      `shoulder_pan / wrist_roll / gripper` 全部冻结、**不进动作向量**
-      （定义在 so101_home_pose.py 的 FROZEN_JOINTS）。
-      因此 setup_mode = single-arm-fixed-gripper（普通 SACAgent，3 维全连续）。
-      ⚠️ 不能用 single-arm-learned-gripper —— 那是 hybrid agent，会把最后一维
-         当夹爪离散头，而我们的最后一维是 wrist_flex。
-    · 不用 RelativeFrame（关节增量没有坐标系，理由见 env.py 的模块注释）
-    · proprio_keys 不含 tcp_force/tcp_torque（SO101 无 F/T 传感器）
+与 HIL-SERL 原始示例的差异：
+    · 动作为三个受控关节的相对角度，三个连续分量。
+    · pan 不冻结；wrist_flex、wrist_roll 和夹爪在录制/跟随时冻结。
+    · setup_mode=single-arm-fixed-gripper；动作最后一维不是夹爪。
+    · 不使用 RelativeFrame；proprio 保留关节位置与速度。
 """
 
 import gymnasium as gym
@@ -29,25 +22,22 @@ from serl_launcher.wrappers.serl_obs_wrappers import SERLObsWrapper
 from serl_launcher.wrappers.chunking import ChunkingWrapper
 
 from experiments.config import DefaultTrainingConfig
-from experiments.so101.env import SO101Env
-from experiments.so101.so101_home_pose import N_ACTION, N_ALL
+SO101Env = None  # Hardware dependencies are imported only by the real actor.
+from experiments.so101.joint_control import ACTION_SEMANTICS, OBSERVATION_SEMANTICS, PROPRIO_DIMS, DEFAULT_STEP_RAD, CONTROL_HZ
+from experiments.so101.pose_alignment import ALIGNMENT
+from experiments.so101.camera_observation import load_roi, load_main_roi
+from experiments.so101.so101_home_pose import N_ACTION, N_ALL, CONTROLLED_JOINTS
 
 
 class TrainConfig(DefaultTrainingConfig):
     # ---- 观测 ----
     image_keys = ['cam_main', 'cam_wrist']
-    classifier_keys = ['cam_main']          # 阶段 B3 训 reward classifier 用
-    proprio_keys = ['joint_pos', 'joint_vel']   # 无 tcp_force/tcp_torque
+    classifier_keys = []          # 阶段 B3 训 reward classifier 用
+    proprio_keys = ['joint_pos', 'joint_vel', 'command_error', 'hold_offset']   # 无 tcp_force/tcp_torque
 
     # ---- 网络 ----
     encoder_type = 'resnet-pretrained'
-    # ★ 动作空间是 **3 维**（只有 shoulder_lift / elbow_flex / wrist_flex，
-    #   见 so101_home_pose.py）：pan / wrist_roll / gripper 全部冻结，
-    #   夹爪**不在动作里**。
-    #   所以必须用 'single-arm-fixed-gripper' → 普通 SACAgent，3 维全连续。
-    #   ⚠️ 不能用 'single-arm-learned-gripper'：那是 SACAgentHybridSingleArm，
-    #      它把**最后一维**当夹爪离散头（`action_dim = shape[-1] - 1`），
-    #      于是 wrist_flex 会被误当成夹爪头，动作语义整个错位。
+    # Four relative joint components; no hybrid gripper head.
     setup_mode = 'single-arm-fixed-gripper'
 
     # ---- 训练规模（真机调试先从小的开始）----
@@ -68,7 +58,9 @@ class TrainConfig(DefaultTrainingConfig):
     checkpoint_period = 1000
 
     # ---- env 参数 ----
-    ENV_HZ = 10.0
+    ENV_HZ = CONTROL_HZ
+    CONTROL_BACKEND = 'lerobot_native_v1'
+    POSE_ALIGNMENT = ALIGNMENT
     # ★ 观测图像边长（两个相机都用它，正方形）。
     #   为什么不是默认的 128：相机源分辨率是 cam_main 640x480、cam_wrist 424x240，
     #   缩到 128 会把细节全丢掉 —— 标定时**看不出试管有没有进孔**，而且
@@ -83,32 +75,30 @@ class TrainConfig(DefaultTrainingConfig):
     #     · 224 也是 ImageNet 预训练 ResNet 的标准输入尺度
     #   cam_main 其实能给更高；将来若要分相机设置，改这里 + env 的 image_sizes。
     IMAGE_SIZE = 224
-    ACTION_SCALE = 0.05             # rad/步；10Hz 下 ≈ 28.6°/s
-    MAX_EPISODE_STEPS = 100
+    ACTION_SCALE = DEFAULT_STEP_RAD  # 4 degrees/request, covering approved 30 Hz trace max 3.69 degrees
+    ACTION_JOINTS = list(CONTROLLED_JOINTS)
+    ACTION_SEMANTICS = ACTION_SEMANTICS
+    OBSERVATION_SEMANTICS = OBSERVATION_SEMANTICS
+    MAX_EPISODE_STEPS = 300         # Preserve the existing 10-second episode budget at 30 Hz.
     DISPLAY_IMAGE = False           # True 会弹窗显示两路相机
 
-    # ---- 起始位置随机化 ----
-    # ★ 只随机化 **shoulder_pan** 一个关节 ⇒ 末端沿一条**水平圆弧**滑动 ±1cm。
-    #   其余关节一动不动，所以三件事是**精确**成立的：管子倾角不变、
-    #   末端高度不变（dz < 35nm，来自 pan 轴 0.0002° 的装配误差）、
-    #   不存在姿态分支问题（根本不做 IK）。
-    #   （用户 2026-09-30："随机性小一点，只有第一个维度有比较小的随机性，
-    #     相当于只水平移动"；见 动作空间-冻结维度.md §3.7）
-    #
-    # ⚠️ 别再回到"三维框 + IK"：pan 解冻后 IK 有 1 维零空间（pan 转 + 手臂反绕
-    #    能到同一个末端），真机上表现为起点**有时非常高/收起来**。实测 2000 次：
-    #    shoulder_lift 跨度 36.2°、elbow_flex 52.6°、wrist_flex 31.5°，
-    #    而末端位置(±2.5cm)和倾角(0.05°)却都正常 —— 当时的验证**没查姿态**。
-    #    离线复核：phase0_randomize_check.py（含"请求位移 == 实际位移"的 1:1 对账，
-    #    这一条才能抓住半径算错之类的量值 bug）。
+    # ---- 起始位置随机化：前三个关节独立 ±1.5°，腕部补偿倾角 ----
     RANDOMIZE_START = True
-    RANDOMIZE_HALF_M = 0.01         # ±1cm 水平弧（与 so101_home_pose.RANDOMIZE_HALF_M 一致）
+    RANDOMIZE_HALF_M = 0.01  # Legacy metadata; no longer drives sampling.
+    RANDOMIZE_JOINT_HALF_DEG = 1.5
 
     # ---- reward 判据（B0.5 占位）----
     # 五个臂关节的目标位姿（rad）。None 表示不判成功（reward 恒 0，仅用于先跑通链路）。
     # 你要做具体任务时改这里，或改成接 reward classifier。
+    REWARD_SOURCE = 'human_episode_annotation'
     TARGET_JOINT_POSE = None
     TARGET_TOL = 0.15
+
+    def __init__(self):
+        self.roi_spec = load_roi()
+        self.main_roi_spec = load_main_roi()
+        self.image_keys = ['cam_main', 'cam_wrist'] + (
+            ['cam_main_roi'] if self.roi_spec else [])
 
     def get_environment(self, fake_env=False, save_video=False, classifier=False,
                         enable_keyboard=True, randomize_start=None):
@@ -133,7 +123,16 @@ class TrainConfig(DefaultTrainingConfig):
                 img=self.IMAGE_SIZE,      # ★ 必须与真实 env 一致
             )
 
+        global SO101Env
+        if SO101Env is None:
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from experiments.so101.native_env import NativeSO101Env
+            SO101Env = NativeSO101Env
         env = SO101Env(
+            roi_spec=self.roi_spec,
+            main_roi_spec=self.main_roi_spec,
             hz=self.ENV_HZ,
             action_scale=self.ACTION_SCALE,
             max_episode_steps=self.MAX_EPISODE_STEPS,
@@ -142,6 +141,7 @@ class TrainConfig(DefaultTrainingConfig):
             randomize_start=(self.RANDOMIZE_START if randomize_start is None
                              else randomize_start),
             randomize_half_m=self.RANDOMIZE_HALF_M,
+            randomize_joint_half_deg=self.RANDOMIZE_JOINT_HALF_DEG,
             enable_keyboard=enable_keyboard,
         )
         # ★ SERLObsWrapper 契约：把 {"state": {...}, "images": {...}} 拍平成
@@ -184,8 +184,8 @@ class _FakeSpacesOnlyEnv(gym.Env):
 
     def __init__(self, image_keys, proprio_keys, img=128,
                  n_joints=N_ALL, n_action=N_ACTION, obs_horizon=1):
-        # 每个 proprio key 贡献 n_joints 维（joint_pos / joint_vel 各 6 维 → 12）
-        state_dim = n_joints * len(proprio_keys)
+        # 按各 key 的真实维度求和：6+6+3+3=18。
+        state_dim = sum(PROPRIO_DIMS[key] for key in proprio_keys)
         self.observation_space = gym.spaces.Dict({
             'state': gym.spaces.Box(-np.inf, np.inf,
                                     (obs_horizon, state_dim), dtype=np.float32),
@@ -194,7 +194,7 @@ class _FakeSpacesOnlyEnv(gym.Env):
                 for k in image_keys
             },
         })
-        # 动作：3 维，只含受控关节（与 SO101Env.action_space 一致）。
+        # 动作：4 维相对关节角，与 SO101Env.action_space 一致。
         # ★ 动作**不带** obs_horizon 维：ChunkingWrapper 在 act_exec_horizon=None
         #   时直接透传 env.action_space。
         self.action_space = gym.spaces.Box(-1.0, 1.0, (n_action,), dtype=np.float32)
