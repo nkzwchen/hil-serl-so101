@@ -22,7 +22,11 @@ def wire_config(port):
 
 def client(args):
     from agentlace.trainer import TrainerClient
-    return TrainerClient('human_episode_client', args.host, wire_config(args.port),
+    class EpisodeClient(TrainerClient):
+        def update(self):
+            # This protocol has no raw transition stores; admission is episode RPC only.
+            return True
+    return EpisodeClient('human_episode_client', args.host, wire_config(args.port),
                          wait_for_server=False, timeout_ms=120000)
 
 
@@ -221,15 +225,27 @@ def main():
                 obs = {k: np.zeros(s.shape, s.dtype) for k,s in cfg.get_environment(fake_env=True).observation_space.spaces.items()}
             action = np.asarray(agent.sample_actions(obs, argmax=True))
             assert action.shape == (3,) and np.isfinite(action).all() and (np.abs(action)<=1).all()
+            durations = []
+            for _ in range(10):
+                started = time.perf_counter()
+                np.asarray(agent.sample_actions(obs, argmax=True))
+                durations.append(time.perf_counter()-started)
+            result['inference_ms_median'] = float(np.median(durations)*1000)
+            result['inference_ms_max'] = float(max(durations)*1000)
             result['test_action'] = action.tolist()
             if args.mode == 'actor':
+                if result['step'] < 1:
+                    raise ValueError('Untrained policy cannot drive hardware')
                 if result['spec'].get('allow_provisional'):
                     raise ValueError('Provisional smoke-test policy cannot drive hardware')
                 # Download once before opening hardware; no network requests in control loop.
                 import record_demo_so101
                 sys.argv = ['record_demo_so101.py', *args.record_args]
                 print('Policy loaded. SPACE toggles intervention. Episodes remain pending human labels.', flush=True)
-                record_demo_so101.main(policy=lambda obs: np.asarray(agent.sample_actions(obs, argmax=True)))
+                def policy(obs):
+                    return np.asarray(agent.sample_actions(obs, argmax=True))
+                policy.metadata = dict(step=result['step'], spec=result['spec'])
+                record_demo_so101.main(policy=policy)
         print(json.dumps(result), flush=True)
     finally:
         c.stop()

@@ -567,6 +567,8 @@ def main(policy=None):
                 kb.drain()
                 kb.reassert()
                 print(f'\n[RECORD] {KEYS_BY_PHASE["RECORD"]}')
+                if policy is not None:
+                    print('  SPACE = toggle human intervention; rewards wait for episode annotation')
                 epfile = os.path.join(outdir, f'ep_{ep:04d}.pkl')
                 recorder = AsyncEpisodeRecorder(epfile)
                 n_steps, n_itv, quality_bad_steps, t_start = 0, 0, 0, time.time()
@@ -724,6 +726,7 @@ def main(policy=None):
                               safety_error=safety_error)
                 saved_meta = recorder.finish({
                         'index': ep, 'start_info': st,
+                        'policy': getattr(policy, 'metadata', None),
                         'capture_policy': 'retain_all_with_quality_flags_v1',
                         **review,
                         'action_dim': N_ACTION,
