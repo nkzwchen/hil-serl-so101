@@ -214,9 +214,9 @@ def main():
             agent = make_agent(args,cfg)
             agent = agent.replace(state=agent.state.replace(params=jax.device_put(result.pop('params'))))
             if args.file and args.mode == 'policy-check':
-                import pickle
+                from experiments.so101.human_reward import RecordingUnpickler
                 with open(args.file, 'rb') as f:
-                    obs = pickle.load(f)['transitions'][0]['observations']
+                    obs = RecordingUnpickler(f).load()['transitions'][0]['observations']
             else:
                 obs = {k: np.zeros(s.shape, s.dtype) for k,s in cfg.get_environment(fake_env=True).observation_space.spaces.items()}
             action = np.asarray(agent.sample_actions(obs, argmax=True))

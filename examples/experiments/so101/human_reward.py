@@ -4,6 +4,15 @@ import hashlib
 import json
 from pathlib import Path
 import numpy as np
+import pickle
+
+
+class RecordingUnpickler(pickle.Unpickler):
+    """Read trusted NumPy 2 recordings with the cloud's NumPy 1.26 runtime."""
+    def find_class(self, module, name):
+        if module.startswith('numpy._core') and int(np.__version__.split('.')[0]) < 2:
+            module = module.replace('numpy._core', 'numpy.core', 1)
+        return super().find_class(module, name)
 
 
 def load_episode(path, config, allow_provisional=False):
@@ -23,7 +32,7 @@ def load_episode(path, config, allow_provisional=False):
     if lab.get('status') not in ('success', 'failed'):
         raise ValueError('Episode must be explicitly labeled success or failed')
     with path.open('rb') as f:
-        raw = pickle.load(f)  # Only trusted, user-owned recording files.
+        raw = RecordingUnpickler(f).load()  # Only trusted, user-owned recording files.
     meta, ts = raw['meta'], raw['transitions']
     if meta.get('operator_excluded') or meta.get('recording', {}).get('has_gaps'):
         raise ValueError('Excluded episode or missing recording steps')
