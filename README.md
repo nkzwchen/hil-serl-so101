@@ -115,3 +115,59 @@ cd /root/gpufree-data/so101-human-reward
 ```
 
 人工修改标签后，应从头建立正式训练 run，去掉 `--resume` 和 `--allow-provisional`；旧粗标签检查点的奖励含义已经改变，入口会拒绝混用。
+
+## TensorBoard 实时看板
+
+监控进程只读 JSON 日志，不阻塞或重启 learner。安装监控依赖（不需要 TensorFlow）：
+
+```bash
+python -m pip install -r so101_tools/requirements-monitor.txt
+```
+
+云端另开终端，将 `RUN_DIR` 改为当前 learner 的 `--out` 目录，`DATA_DIR` 改为其 `--data` 目录：
+
+```bash
+cd /root/gpufree-data/so101-human-reward
+export RUN_DIR=/root/gpufree-data/training_runs/human_reviewed_20261010_j85vk4eh
+export DATA_DIR=/root/gpufree-data/demos/human_reviewed_20261010_trial
+/root/gpufree-data/conda_envs/so101-hilserl/bin/python so101_tools/training_monitor.py \
+  --run "$RUN_DIR" --data "$DATA_DIR"
+```
+
+监控每 2 秒读取新增日志，旧日志自动回填。当前 learner 更新结束后，训练曲线不再增加；服务接收新人工标签时，episode 指标仍会更新。监控默认每次启动创建新的事件子目录；只启动一个监控进程，避免同一数据出现多个 run。
+
+云端另一个终端启动网页：
+
+```bash
+/root/gpufree-data/conda_envs/so101-hilserl/bin/python -m tensorboard.main \
+  --logdir /root/gpufree-data/training_runs \
+  --host 127.0.0.1 --port 6006 --reload_interval 2
+```
+
+本地转发端口后，浏览器访问 http://localhost:6006 ：
+
+```bash
+ssh -N -L 6006:127.0.0.1:6006 -p SSH_PORT USER@HOST
+```
+
+已有 SSH ControlMaster 时，也可以使用 `ssh -S /tmp/so101_train.sock -O forward -L 6006:127.0.0.1:6006 -p SSH_PORT USER@HOST` 加入端口转发，无需重开训练连接。
+
+| TensorBoard 标签 | 含义 / 横轴 |
+|---|---|
+| train/actor/actor_loss、train/critic/critic_loss | 策略/价值损失；训练更新 step |
+| train/critic/predicted_qs、target_qs | batch 平均预测 Q 和目标 Q；训练 step |
+| train/critic/rewards | batch 平均奖励，不是成功率；训练 step |
+| train/actor/temperature、entropy | SAC 温度与熵；训练 step |
+| episodes/demo/* | 初始演示池统计；该池累计接收 episode 数 |
+| episodes/online/* | 后续接收段统计；该池累计接收 episode 数 |
+| capture_intervention_fraction | 全部原始 RECORD 步中的接管占比，0..1；不是只算成功帧前的裁剪部分 |
+| capture_duration_s、capture_steps、capture_timeout | 每段耗时、原始步数、是否超时；缺失字段不伪造为 0 |
+| human_return | 人工标成功为 1、失败为 0；与训练 batch reward 分开 |
+| success_rate、last20_success_rate | 有效人工复核段的累计/最近 20 段成功率；不含粗标签 |
+| reviewed_count、last20_count | 对应成功率的样本数 |
+| autonomous_success_rate、autonomous_reviewed_count | 有策略元数据且全段无接管的人工复核段；零样本时只显示 count=0，不编造成功率 |
+| timeout_rate | 已知超时状态的接收段中超时比例 |
+
+成功率在人工标签提交后更新；已排除、未提交/被拒收的段不在 learner 接收统计中，因此看板不是所有尝试的无偏评估。最近 20 段按接收顺序计算，不按录制时间排序。不同模型版本暂未进一步分组，无接管成功率也不替代受控评测。
+
+云端看不到还留在本地的待标注文件。若需查看本地待标注/待上传数量，在本地运行同一监控命令，附加 `--recordings /path/to/actor/session`；`local_queue/*` 横轴为队列变化次数。没有 delivery 状态的旧录制计入 untracked，不假定为未标注。`--once` 可仅导出一次。

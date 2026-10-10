@@ -15,6 +15,21 @@ class RecordingUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
+def capture_summary(transitions, meta):
+    """Full RECORD segment statistics, before success-frame trimming; unknown is not zero."""
+    import math
+    flags = [t.get('infos', {}).get('intervening') for t in transitions]
+    known = all(isinstance(x, (bool, np.bool_)) for x in flags) and bool(flags)
+    duration = meta.get('record_sec')
+    if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration < 0:
+        duration = None
+    return dict(steps=len(transitions),
+                intervention_steps=sum(bool(x) for x in flags) if known else None,
+                intervention_fraction=sum(bool(x) for x in flags)/len(flags) if known else None,
+                duration_s=duration, timeout=meta.get('episode_timeout'),
+                policy_present=bool(meta.get('policy')))
+
+
 def load_episode(path, config, allow_provisional=False):
     import pickle
     path = Path(path)
@@ -68,5 +83,5 @@ def load_episode(path, config, allow_provisional=False):
         result.append(t)
     receipt = dict(id=hashlib.sha256((digest + json.dumps(lab, sort_keys=True)).encode()).hexdigest(),
                    recording_sha256=digest, file=path.name, label=copy.deepcopy(lab),
-                   transitions=len(result), quality_flagged=sum(not t.get('infos', {}).get('quality_ok', True) for t in ts[:end]))
+                   transitions=len(result), capture=capture_summary(ts, meta), quality_flagged=sum(not t.get('infos', {}).get('quality_ok', True) for t in ts[:end]))
     return result, receipt
