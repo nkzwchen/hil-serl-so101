@@ -105,6 +105,10 @@ class StubEnv(gym.Env):
             time.sleep(0.02)
 
     # ---- recorder 用到的接口 ----
+    @property
+    def is_intervening(self):
+        return self._intervening
+
     def set_intervening(self, on):
         self._intervening = bool(on)
 
@@ -248,7 +252,7 @@ class StubKeys:
 
 
 # ----------------------------------------------------------------- the test
-def main(inject_camera_failure=False, inject_repeat=False, inject_safety_error=False, mark_short=False, inject_control_limit=False):
+def main(inject_camera_failure=False, inject_repeat=False, inject_safety_error=False, mark_short=False, inject_control_limit=False, policy_mode=False):
     tmp = tempfile.mkdtemp(prefix='recflow_')
     # 2 段：每段  c(开始) -> [env 自己 done] -> c(回程结束) -> ... ；最后 q 退出
     # 注意 RECORD 里第 3 步会按 d 提前结束
@@ -317,7 +321,10 @@ def main(inject_camera_failure=False, inject_repeat=False, inject_safety_error=F
     if mark_short:
         sys.argv += ['--min-steps', '100']
     try:
-        rc = R.main()
+        def policy(obs):
+            return np.array([.25,-.1,.2], dtype=np.float32)
+        policy.metadata = {'step': 123}
+        rc = R.main(policy=policy if policy_mode else None)
     finally:
         sys.argv = argv
 
@@ -395,7 +402,14 @@ def main(inject_camera_failure=False, inject_repeat=False, inject_safety_error=F
         assert d['meta']['max_repeated_camera_steps'] is None
 
     assert trs[-1]['dones'] is True and trs[-1]['masks'] == 0.0
-    assert all(x['infos']['intervening'] for x in trs), '记录段应该全程接管'
+    if policy_mode:
+        assert all(not x['infos']['intervening'] for x in trs)
+        for x in trs:
+            np.testing.assert_allclose(x['actions'], [.25,-.1,.2])
+            assert x['rewards'] == 0.0, 'Actor must not create reward labels'
+        assert d['meta']['policy'] == {'step': 123}
+    else:
+        assert all(x['infos']['intervening'] for x in trs), '记录段应该全程接管'
     print(f'  actions.shape={t["actions"].shape}  dones 末尾={trs[-1]["dones"]}  '
           f'masks 末尾={trs[-1]["masks"]}')
     print(f'  ep0.meta = {d["meta"]}')
@@ -445,6 +459,7 @@ if __name__ == '__main__':
     test_camera_repeat_boundaries()
     test_missing_leader_service_blocks_preflight_before_torque()
     main()
+    main(policy_mode=True)
     main(inject_camera_failure=True)
     main(inject_repeat=True)
     main(inject_safety_error=True)

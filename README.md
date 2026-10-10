@@ -32,7 +32,7 @@ python so101_tools/train_human.py train --data /path/session --out training_runs
   --steps 1000 --batch-size 32 --serve-seconds 3600
 ```
 
-默认使用预训练 ResNet-10，三路图像 SAC。首次没有在线已标注数据时只采样 demonstrations；收到在线段后每批一半 demonstrations、一半 online。`--steps` 是本次梯度更新数，不是录制步数。更新结束后保存完整优化器和参数，重新加载并比较动作。`--serve-seconds` 是更新完成后的服务保留时长；服务期间只收段/提供参数，不继续梯度更新，继续训练需再次启动并恢复检查点。当前数据保存在内存，训练规模应按云端 RAM 调整。
+默认使用预训练 ResNet-10，三路图像 SAC。首次没有在线已标注数据时只采样 demonstrations；收到在线段后每批一半 demonstrations、一半 online。`--steps` 是本次梯度更新数，不是录制步数。每 `--checkpoint-every` 次更新（默认 100 次）及更新结束后保存完整优化器和参数，重新加载并比较动作。`--serve-seconds` 是更新完成后的服务保留时长；服务期间只收段/提供参数，不继续梯度更新，继续训练需再次启动并恢复检查点。当前数据保存在内存，训练规模应按云端 RAM 调整。
 
 ```bash
 python so101_tools/train_human.py train --data /path/session --out training_runs/run2 \
@@ -68,3 +68,23 @@ python so101_tools/train_human.py submit --file session2_ep_0000.pkl
 服务端重复提交去重；已收录段改标签需停止并重建 replay，防止新旧奖励混用。训练入口拒绝旧的 `train_rlpd.py --exp_name so101`，避免把原始 0 奖励直接加入训练。
 
 当前云端测试不等同于策略任务成功率或真机安全验收。上游项目文档保存在 README_upstream.md。
+
+## 本次已验证的云端路径（2026-10-10）
+
+- 代码：`/root/gpufree-data/so101-human-reward`（独立 worktree，保留原仓库工作区）。
+- 数据：`/root/gpufree-data/demos/human_smoke_inbox`，10 段粗标签，1193 条转换后 transition。
+- 最近检查点：`/root/gpufree-data/offline_test/human_reward_resume_20261010/checkpoint_5.msgpack`。
+- 验证记录：[云端测试报告](docs/so101/cloud_human_reward_validation.md)。
+
+继续有限步离线测试（不连接机器人）：
+
+```bash
+cd /root/gpufree-data/so101-human-reward
+/root/gpufree-data/conda_envs/so101-hilserl/bin/python so101_tools/train_human.py train \
+  --data /root/gpufree-data/demos/human_smoke_inbox \
+  --resume /root/gpufree-data/offline_test/human_reward_resume_20261010/checkpoint_5.msgpack \
+  --out /root/gpufree-data/offline_test/human_next_run \
+  --steps 100 --batch-size 4 --allow-provisional
+```
+
+人工修改标签后，应从头建立正式训练 run，去掉 `--resume` 和 `--allow-provisional`；旧粗标签检查点的奖励含义已经改变，入口会拒绝混用。
