@@ -108,7 +108,7 @@ def _ep_from_transitions(trs):
         for k in cams:
             cams[k].append(_squeeze(final[k]))
         frames['states'].append(_squeeze(final.get('state')))
-        frames['actions'].append(np.zeros_like(frames['actions'][-1]))
+        frames['actions'].append(np.full_like(frames['actions'][-1], np.nan))  # No action follows final observation.
         frames['intervening'].append(False)
     T = len(trs) + bool(trs)
     for k in cams:
@@ -233,6 +233,12 @@ class Labeler:
         self.canv['zoom'].pack()
         self._zoom_img_id = self.canv['zoom'].create_image(0, 0, anchor='nw')
 
+        self.action_plot = tk.Canvas(self.root, height=190, bg='#151515', highlightthickness=0)
+        self.action_plot.pack(fill='x', padx=10, pady=4)
+        self.action_plot.bind('<Configure>', lambda e: self._draw_action_plot() if self.episodes else None)
+        self.action_plot.bind('<Button-1>', self._seek_plot)
+        self.action_plot.bind('<B1-Motion>', self._seek_plot)
+
         # 画面下：帧滑块
         bot = tk.Frame(self.root, bg=BG)
         bot.pack(fill='x', padx=8, pady=(6, 2))
@@ -266,6 +272,7 @@ class Labeler:
         _btn('OK success (s)', self._mark_success, 11)
         _btn('FAIL (f)', self._mark_failed, 11)
         _btn('clear (c)', self._clear, 8)
+        _btn('success frame (j)', self._jump_success, 16)
         tk.Label(bar, text='   ', bg=BG).pack(side='left')
         _btn('< prev ep (p)', lambda: self._step_ep(-1), 11)
         _btn('next ep (n) >', lambda: self._step_ep(+1), 11)
@@ -301,7 +308,7 @@ class Labeler:
                       ('p', lambda: self._step_ep(-1)), ('z', lambda: self._zoom(-2)),
                       ('Z', lambda: self._zoom(+2)), ('t', self._toggle_src),
                       ('g', self._toggle_interp), ('r', self._recenter),
-                      ('w', self._save),
+                      ('j', self._jump_success), ('w', self._save),
                       ('q', self._quit)):
             r.bind(k, lambda e, fn=fn: fn())
         for key in ('cam_main', 'cam_wrist', 'cam_main_roi'):
@@ -442,6 +449,7 @@ class Labeler:
         self._draw_roi()
         self._draw_zoom()
         self.scale.set(self.fr)
+        self._draw_action_plot()
 
         ep = self._cur()
         lab = self.labels.get(self.ep, {})
@@ -476,11 +484,75 @@ class Labeler:
         synth = ('   [NOTE] SYNTHETIC test data: static photo + drawn tube, '
                  'only the drawn bar moves' if 'SYNTHETIC' in note else '')
         self.lbl_info.config(
-            text=(f'frame {self.fr+1}/{ep["n"]}   {play}   intervening: '
+            text=(f'frame {self.fr} / {ep["n"]-1} (0-based)   {play}   intervening: '
                   f'{"yes" if itv else "no"}'
-                  f'   action = [{a[0]:+.3f}, {a[1]:+.3f}, {a[2]:+.3f}]'
+                  + (f'   action = [{a[0]:+.3f}, {a[1]:+.3f}, {a[2]:+.3f}]'
+                   if np.isfinite(a).any() else '   final observation: no outgoing action')
                   + (f'\njoint_pos(6): {jp}' if jp else '')
                   + synth))
+
+    def _jump_success(self):
+        lab = self.labels.get(self.ep, {})
+        if lab.get('status') == 'success' and isinstance(lab.get('frame'), int):
+            self._goto_frame(lab['frame'])
+
+    def _seek_plot(self, event):
+        width = max(self.action_plot.winfo_width() - 100, 1)
+        frame = round((event.x - 60) / width * max(self._n_frames() - 1, 1))
+        self._goto_frame(frame)
+
+    def _draw_action_plot(self):
+        """Actions at observation i drive transition i; final observation has no action."""
+        if not self.episodes:
+            return
+        c = self.action_plot
+        c.delete('all')
+        ep = self._cur()
+        right = max(c.winfo_width() - 40, 100)
+        x = lambda i: 60 + (right - 60) * i / max(ep['n'] - 1, 1)
+        colors = ['#69c9ff', '#ffae57', '#c792ea', '#ff6b89']
+        actions = np.asarray(ep['actions'], dtype=float)
+        bound = max(1., float(np.nanmax(np.abs(actions))) if np.isfinite(actions).any() else 1.)
+        c.create_text(60, 10, anchor='w', fill=FG,
+                      text='Requested actions (normalized): pan / lift / elbow [ / wrist ]   |   click to seek; j = success frame')
+        for value in (-bound, 0, bound):
+            y = 65 - value / bound * 35
+            c.create_line(60, y, right, y, fill='#444')
+            c.create_text(52, y, anchor='e', text=f'{value:g}', fill='#aaa')
+        def curve(values, y_fn, color):
+            points = []
+            def flush():
+                if len(points) >= 4:
+                    c.create_line(*points, fill=color, width=2, tags='curve')
+                elif points:
+                    px, py = points
+                    c.create_oval(px-2, py-2, px+2, py+2, fill=color, outline=color, tags='curve')
+            for i, value in enumerate(values):
+                if np.isfinite(value):
+                    points.extend((x(i), y_fn(value)))
+                else:
+                    flush(); points = []
+            flush()
+        for j in range(min(actions.shape[1], 4)):
+            curve(actions[:, j], lambda v: 65-v/bound*35, colors[j])
+            c.create_text(right-320+j*80, 112, text=['pan','lift','elbow','wrist'][j], fill=colors[j])
+        speeds = []
+        for state in ep['states']:
+            st = np.asarray(state).reshape(-1) if state is not None else np.array([])
+            offset = {18:12, 20:14, 12:6}.get(st.size)
+            speeds.append(float(np.degrees(np.linalg.norm(st[offset:offset+3]))) if offset is not None else np.nan)
+        speed_max = max(1., float(np.nanmax(speeds))) if np.isfinite(speeds).any() else 1.
+        c.create_text(60, 128, anchor='w', fill='#9be28f', text=f'Measured pan/lift/elbow speed norm (deg/s), scale 0..{speed_max:.1f}')
+        curve(speeds, lambda v: 174-v/speed_max*35, '#9be28f')
+        c.create_line(60, 174, right, 174, fill='#444')
+        lab = self.labels.get(self.ep, {})
+        success = lab.get('frame')
+        if lab.get('status') == 'success' and isinstance(success, int) and 0 <= success < ep['n']:
+            color = WARN if lab.get('provisional') else ACCENT
+            c.create_line(x(success), 23, x(success), 178, fill=color, width=3, dash=(5,3), tags='success_marker')
+            c.create_text(x(success), 185, anchor='e' if success > ep['n']/2 else 'w', fill=color,
+                          text=f'{"PROVISIONAL" if lab.get("provisional") else "SUCCESS"} frame {success}', tags='success_marker')
+        c.create_line(x(self.fr), 23, x(self.fr), 178, fill='white', dash=(2,4), tags='cursor')
 
     # ---------------- 交互 ----------------
     def _step(self, d):

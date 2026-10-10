@@ -381,6 +381,13 @@ def print_banner(env, args):
 
 
 # ===================================================================== main
+ACTOR_EPISODE_SECONDS = 20.0
+
+
+def actor_deadline_expired(deadline):
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def main(policy=None, on_episode_saved=None):
     delivery_failed = False
     ap = argparse.ArgumentParser()
@@ -413,6 +420,8 @@ def main(policy=None, on_episode_saved=None):
         enable_keyboard=False,        # ★ 接管状态由本脚本掌管（见文件头 Keys 一节）
         randomize_start=(cfg.RANDOMIZE_START and not args.no_randomize),
     )
+    if policy is not None:
+        env.unwrapped.max_episode_steps = math.ceil(ACTOR_EPISODE_SECONDS * env.unwrapped.hz)
     recorder = None
     try:
         with NonBlockingKey() as kb:
@@ -442,7 +451,7 @@ def main(policy=None, on_episode_saved=None):
                 'env_hz': cfg.ENV_HZ, 'action_scale': cfg.ACTION_SCALE,
                 'control_backend': cfg.CONTROL_BACKEND,
                 'pose_alignment': cfg.POSE_ALIGNMENT,
-                'max_episode_steps': cfg.MAX_EPISODE_STEPS,
+                'max_episode_steps': env.unwrapped.max_episode_steps,
                 'image_size': cfg.IMAGE_SIZE, 'action_dim': N_ACTION,
                 'action_semantics': cfg.ACTION_SEMANTICS,
                 'observation_semantics': cfg.OBSERVATION_SEMANTICS,
@@ -573,10 +582,15 @@ def main(policy=None, on_episode_saved=None):
                 epfile = os.path.join(outdir, f'ep_{ep:04d}.pkl')
                 recorder = AsyncEpisodeRecorder(epfile)
                 n_steps, n_itv, quality_bad_steps, t_start = 0, 0, 0, time.time()
+                deadline = time.monotonic() + ACTOR_EPISODE_SECONDS if policy is not None else None
+                episode_timeout = False
                 camera_repeat_streak = {}
                 safety_error = None
                 done, truncated = False, False
                 while not done:
+                    if actor_deadline_expired(deadline):
+                        episode_timeout = truncated = True
+                        break
                     k = poll(kb, 'dDqQxXhH ')
                     if policy is not None and k == ' ':
                         env.unwrapped.set_intervening(not env.unwrapped.is_intervening)
@@ -601,6 +615,9 @@ def main(policy=None, on_episode_saved=None):
                                      else np.zeros(N_ACTION, dtype=np.float32))
                         if requested.shape != (N_ACTION,) or not np.isfinite(requested).all() or np.any(np.abs(requested) > 1):
                             raise RuntimeError('Invalid policy action')
+                        if actor_deadline_expired(deadline):
+                            episode_timeout = truncated = True
+                            break  # Inference finished too late: do not send its action.
                         next_obs, rew, env_done, trunc, info = env.step(requested)
                     except (RuntimeError, KeyboardInterrupt) as exc:
                         safety_error = f'{type(exc).__name__}: {exc}'
@@ -632,7 +649,9 @@ def main(policy=None, on_episode_saved=None):
                     if control and (not control.get('accepted',True) or control.get('limited',False)):
                         quality_failed=True
                         quality_problems.append('joint_control: '+str(control.get('reason',control.get('joint_reasons'))))
-                    done = env_done
+                    episode_timeout = actor_deadline_expired(deadline)
+                    done = env_done or trunc or episode_timeout
+                    truncated = bool(trunc) or episode_timeout
                     act = info.get('intervene_action', requested)
                     itv = bool(info.get('intervening', False))
                     n_itv += int(itv)
@@ -642,7 +661,7 @@ def main(policy=None, on_episode_saved=None):
                         # env 自己结束的（步数预算用满 / 判成功）—— 说清楚，
                         # 免得看起来像"按了 d 就没了"。踩坑：对齐阶段耗掉的
                         # 步数曾经让这里在第一步就触发（见上面的 _step_count 注释）。
-                        truncated = bool(trunc) or n_steps + 1 >= env.max_episode_steps
+                        truncated = truncated or bool(trunc) or n_steps + 1 >= env.max_episode_steps
                         print(f'  ⓘ env 自己结束了本段（第 {n_steps + 1} 步，'
                               f'step budget={env.max_episode_steps}）'
                               + ('，按"超长截断"记录' if truncated else ''))
@@ -667,6 +686,8 @@ def main(policy=None, on_episode_saved=None):
                         if len(recorder.dropped) == 1:
                             print('  保存队列异常：继续控制，缺失步将明确标记，不能直接用于训练。')
                     n_steps += 1
+                if episode_timeout:
+                    print('  达到 20 秒执行时限：停止本段策略执行，进入人工回程；保留数据供标注。')
                 seg_sec = time.time() - t_start
                 hz_act = n_steps / max(seg_sec, 1e-6)
 
@@ -727,6 +748,8 @@ def main(policy=None, on_episode_saved=None):
                               safety_error=safety_error)
                 saved_meta = recorder.finish({
                         'index': ep, 'start_info': st,
+                        'episode_timeout': episode_timeout,
+                        'episode_time_limit_s': ACTOR_EPISODE_SECONDS if policy is not None else None,
                         'policy': getattr(policy, 'metadata', None),
                         'capture_policy': 'retain_all_with_quality_flags_v1',
                         **review,
