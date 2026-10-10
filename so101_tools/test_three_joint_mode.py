@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import unittest
 import numpy as np
 root=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(root/'hil-serl/examples'))
-sys.path.insert(0,str(root/'hil-serl/examples/experiments/so101'))
+sys.path.insert(0,str(root/'examples'))
+sys.path.insert(0,str(root/'examples/experiments/so101'))
 from joint_control import bounded_joint_delta,execute_joint_request,PROPRIO_DIMS,ACTION_SEMANTICS
 from native_io import NativeJointIO
 from so101_home_pose import CONTROLLED_JOINTS,FROZEN_JOINTS,START_JOINT_POSE,randomize_joint_start_pose

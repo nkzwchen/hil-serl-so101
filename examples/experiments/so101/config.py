@@ -32,12 +32,12 @@ from experiments.so101.so101_home_pose import N_ACTION, N_ALL, CONTROLLED_JOINTS
 class TrainConfig(DefaultTrainingConfig):
     # ---- 观测 ----
     image_keys = ['cam_main', 'cam_wrist']
-    classifier_keys = []          # 阶段 B3 训 reward classifier 用
+    classifier_keys = []          # 奖励只来自段后人工标注
     proprio_keys = ['joint_pos', 'joint_vel', 'command_error', 'hold_offset']   # 无 tcp_force/tcp_torque
 
     # ---- 网络 ----
     encoder_type = 'resnet-pretrained'
-    # Four relative joint components; no hybrid gripper head.
+    # Three relative joint components; no hybrid gripper head.
     setup_mode = 'single-arm-fixed-gripper'
 
     # ---- 训练规模（真机调试先从小的开始）----
@@ -89,7 +89,7 @@ class TrainConfig(DefaultTrainingConfig):
 
     # ---- reward 判据（B0.5 占位）----
     # 五个臂关节的目标位姿（rad）。None 表示不判成功（reward 恒 0，仅用于先跑通链路）。
-    # 你要做具体任务时改这里，或改成接 reward classifier。
+    # 训练奖励由段后人工标注生成，不在环境内判断。
     REWARD_SOURCE = 'human_episode_annotation'
     TARGET_JOINT_POSE = None
     TARGET_TOL = 0.15

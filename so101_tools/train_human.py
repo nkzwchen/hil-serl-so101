@@ -49,10 +49,20 @@ def train(args):
     out.mkdir(parents=True, exist_ok=True)
     inbox = Path(args.data).resolve()
     demos, online, receipts = [], [], {}
-    for path in sorted(inbox.glob('ep_*.pkl')):
+    previous = {}
+    if args.resume:
+        manifest = Path(args.resume).parent / 'receipts.json'
+        previous = {r['recording_sha256']: r for r in json.loads(manifest.read_text())}
+    for path in sorted(inbox.glob('*.pkl')):
         ts, receipt = load_episode(path, cfg, args.allow_provisional)
-        demos.extend(ts)
+        prior = previous.get(receipt['recording_sha256'])
+        if prior and prior['id'] != receipt['id']:
+            raise ValueError('Labels changed since checkpoint; start a new run')
+        receipt['role'] = prior.get('role', 'demo') if prior else ('online' if args.resume else 'demo')
+        (online if receipt['role'] == 'online' else demos).extend(ts)
         receipts[receipt['id']] = receipt
+    if previous and not set(previous).issubset({r['recording_sha256'] for r in receipts.values()}):
+        raise ValueError('Resume is missing previously ingested recordings')
     if not demos:
         raise ValueError('No labeled demonstrations')
     print(f'Loaded {len(receipts)} episodes / {len(demos)} transitions; devices={jax.devices()}', flush=True)
@@ -93,6 +103,7 @@ def train(args):
                     if not duplicate:
                         if any(r['recording_sha256'] == receipt['recording_sha256'] for r in receipts.values()):
                             raise ValueError('Relabeled episode already ingested; restart learner to rebuild replay')
+                        receipt['role'] = 'online'
                         online.extend(ts)
                         receipts[receipt['id']] = receipt
                         (out / 'receipts.json').write_text(json.dumps(list(receipts.values()), indent=2))
@@ -104,6 +115,14 @@ def train(args):
     server = TrainerServer(wire_config(args.port), request_callback=callback) if args.serve_seconds else None
     if server:
         server.start(threaded=True)
+    def save_checkpoint():
+        checkpoint = out / f'checkpoint_{step}.msgpack'
+        tmp = checkpoint.with_suffix('.tmp')
+        tmp.write_bytes(serialization.to_bytes(agent.state))
+        tmp.replace(checkpoint)
+        Path(str(checkpoint)+'.json').write_text(json.dumps(dict(spec=spec, step=step), indent=2))
+        return checkpoint
+
     rng = np.random.default_rng(args.seed)
     (out / 'receipts.json').write_text(json.dumps(list(receipts.values()), indent=2))
     try:
@@ -125,11 +144,9 @@ def train(args):
             print(f'update {step}: metrics finite', flush=True)
             with lock:
                 snapshot.update(params=jax.device_get(agent.state.params), step=step)
-        checkpoint = out / f'checkpoint_{step}.msgpack'
-        tmp = checkpoint.with_suffix('.tmp')
-        tmp.write_bytes(serialization.to_bytes(agent.state))
-        tmp.replace(checkpoint)
-        Path(str(checkpoint)+'.json').write_text(json.dumps(dict(spec=spec, step=step), indent=2))
+            if step % args.checkpoint_every == 0:
+                save_checkpoint()
+        checkpoint = save_checkpoint()
         restored = agent.replace(state=serialization.from_bytes(agent.state, checkpoint.read_bytes()))
         obs = demos[0]['observations']
         before = np.asarray(agent.sample_actions(obs, argmax=True))
@@ -158,6 +175,7 @@ def main():
     ap.add_argument('--out', default='training_runs/human')
     ap.add_argument('--steps', type=int, default=10)
     ap.add_argument('--batch-size', type=int, default=4)
+    ap.add_argument('--checkpoint-every', type=int, default=100)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--encoder', choices=['resnet','resnet-pretrained'], default='resnet-pretrained')
     ap.add_argument('--allow-provisional', action='store_true')
@@ -168,7 +186,7 @@ def main():
     ap.add_argument('--file')
     ap.add_argument('--record-args', nargs=argparse.REMAINDER, default=[])
     args = ap.parse_args()
-    if args.steps < 0 or args.batch_size < 1 or args.serve_seconds < 0:
+    if args.steps < 0 or args.batch_size < 1 or args.serve_seconds < 0 or args.checkpoint_every < 1:
         ap.error('Invalid counts')
     if args.mode == 'train':
         train(args)
