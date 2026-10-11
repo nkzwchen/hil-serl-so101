@@ -1,3 +1,5 @@
+> **最新训练设置：** batch=256、discount=0.99；本地训练 actor 使用随机策略采样（每次 split RNG，保留动作限幅/接管）。`--continuous --update-schedule asynchronous` 持续更新，不受新数据额度限制，`--steps 100` 在该模式不是停止条件。运行时限仍为 `--max-runtime-seconds 3600`；如要严格100轮结束，不加 `--continuous`。旧额度模式可用 `--update-schedule data-budget`。每段边界更新 actor 权重、段后人工奖励不变。
+
 > **2026-10-11 主相机双 ROI 更新：** 录制/训练仅使用 `cam_main`、`cam_main_roi`；仅订阅并启动物理 `cam_main`，不再要求腕部相机。两路保持现有裁剪参数，224×224。合并数据位于 `recordings/2026-10-11_merged_main_roi50`（10+40段，原始目录保留）；标签帧号不变，文件哈希已重建。历史腕部质量诊断留作审计，不能视为当前相机要求。旧三图像 checkpoint 不兼容，请使用新训练目录，不要直接恢复旧权重。配置下次启动生效，本次未启动设备/训练。
 
 # SO101 HIL-SERL：人工标注奖励训练

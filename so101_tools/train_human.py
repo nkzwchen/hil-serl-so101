@@ -120,6 +120,7 @@ def _train_locked(args, out):
     batch_size = getattr(args, 'batch_size', None) or cfg.batch_size
     cta_ratio = getattr(args, 'cta_ratio', None) or cfg.cta_ratio
     max_runtime = getattr(args, 'max_runtime_seconds', 3600)
+    update_schedule = getattr(args, 'update_schedule', 'data-budget')
     learning = dict(batch_size=batch_size, cta_ratio=cta_ratio, discount=cfg.discount,
                     replay_semantics=REPLAY_SEMANTICS, capacity=cfg.replay_buffer_capacity)
     step = 0
@@ -133,7 +134,7 @@ def _train_locked(args, out):
         agent = agent.replace(state=serialization.from_bytes(agent.state, Path(args.resume).read_bytes()))
         step = saved['step']
     budget = UpdateBudget(step, args.steps, getattr(args, 'updates_per_transition', .25))
-    if continuous and saved.get('budget'):
+    if continuous and update_schedule == 'data-budget' and saved.get('budget'):
         budget = UpdateBudget(**saved['budget'])
         if budget.updates_per_transition != args.updates_per_transition:
             raise ValueError('Resume must keep updates-per-transition; stored budget is authoritative')
@@ -156,7 +157,8 @@ def _train_locked(args, out):
                     demo_transitions=len(replay.demos), online_transitions=len(replay.online),
                     online_received=replay.online_received, intervention_transitions=replay.interventions_received,
                     episodes=len(replay.receipts), learning=learning, continuous=continuous,
-                    updates_remaining=budget.remaining(step, replay.online_received) if continuous else None,
+                    updates_remaining=budget.remaining(step, replay.online_received) if continuous and update_schedule=='data-budget' else None,
+                    update_schedule=update_schedule,
                     spec=spec)
     def callback(kind, payload):
         try:
@@ -195,7 +197,7 @@ def _train_locked(args, out):
             persist_receipts()
             atomic_json(Path(str(checkpoint)+'.json'), dict(spec=spec, step=step, run_id=run_id,
                         learning=learning, budget=budget.state() if continuous else None,
-                        sampler_state=rng.bit_generator.state, migrated_from=args.resume))
+                        sampler_state=rng.bit_generator.state, update_schedule=update_schedule, migrated_from=args.resume))
         atomic_json(out / 'latest.json', dict(checkpoint=str(checkpoint), step=step))
         return checkpoint
     old_handlers = {}
@@ -208,14 +210,14 @@ def _train_locked(args, out):
     try:
         persist_receipts()
         atomic_json(out / 'learning_config.json', dict(**learning, continuous=continuous,
-                    budget=budget.state(), max_runtime_seconds=max_runtime, run_id=run_id))
+                    budget=budget.state(), update_schedule=update_schedule, max_runtime_seconds=max_runtime, run_id=run_id))
         if server:server.start(threaded=True)
         while not stop.is_set():
             if continuous and time.monotonic()-started >= max_runtime:break
             if not continuous and step-initial_step >= args.steps:break
             with lock:
                 credit = budget.remaining(step, replay.online_received)
-            if continuous and credit == 0:
+            if continuous and update_schedule == 'data-budget' and credit == 0:
                 phase = 'waiting_for_labels'
                 if last_saved != step:
                     save_checkpoint(); last_saved = step
@@ -275,6 +277,8 @@ def main():
     ap.add_argument('--batch-size', type=int, help='Default: TrainConfig.batch_size')
     ap.add_argument('--cta-ratio', type=int, help='Default: TrainConfig.cta_ratio')
     ap.add_argument('--continuous', action='store_true', help='Train on reviewed-data credits; wait when credits are exhausted')
+    ap.add_argument('--update-schedule', choices=['asynchronous','data-budget'], default='asynchronous',
+                    help='Continuous mode: train continuously or wait for reviewed-data credits')
     ap.add_argument('--updates-per-transition', type=float, default=.25)
     ap.add_argument('--max-runtime-seconds', type=float, default=3600)
     ap.add_argument('--migrate-replay-semantics', action='store_true')
@@ -370,8 +374,17 @@ def main():
                 def apply_policy(candidate):
                     nonlocal agent
                     agent = validated_policy_agent(agent, candidate, obs)
+                # Independent RNG stream; split for every executed policy request.
+                import jax
+                sampling_rng = jax.random.PRNGKey(args.seed)
+                def sample_policy(observation):
+                    nonlocal sampling_rng
+                    sampling_rng, key = jax.random.split(sampling_rng)
+                    return np.asarray(agent.sample_actions(observation, argmax=False, seed=key))
+                # Compile the stochastic path before opening the robot environment.
+                sample_policy(obs)
                 policy = EpisodePolicy(result,
-                    lambda obs: np.asarray(agent.sample_actions(obs, argmax=True)),
+                    sample_policy,
                     lambda meta: c.request('policy', {k:meta.get(k) for k in ('step','run_id')}),
                     apply_policy)
                 rc = record_demo_so101.main(policy=policy, on_episode_saved=delivery.process)

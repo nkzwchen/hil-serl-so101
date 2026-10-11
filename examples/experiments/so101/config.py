@@ -41,7 +41,7 @@ class TrainConfig(DefaultTrainingConfig):
     setup_mode = 'single-arm-fixed-gripper'
 
     # ---- 训练规模（真机调试先从小的开始）----
-    batch_size = 64                 # 真机 + 本机 CPU learner 时压小；云端 24G 可到 256
+    batch_size = 256                # 云端训练；本地仅运行 actor
     cta_ratio = 2
     discount = 0.99                 # 比默认 0.97 高（稀疏奖励下视野更长）
     max_steps = 5000
