@@ -238,7 +238,8 @@ def _train_locked(args, out):
             record = dict(step=step, metrics=jax.tree_util.tree_map(lambda x: np.asarray(x).tolist(), serialization.to_state_dict(metrics)))
             record['metrics']['schedule'] = dict(online_received=replay.online_received,
                     intervention_received=replay.interventions_received, cta_ratio=cta_ratio,
-                    updates_remaining=budget.remaining(step, replay.online_received) if continuous else 0)
+                    updates_remaining=budget.remaining(step, replay.online_received) if continuous and update_schedule=='data-budget' else None,
+                    update_schedule=update_schedule)
             with (out / 'metrics.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
             print(f'update {step}: metrics finite', flush=True)
             # Publish a coherent snapshot only after the entire update cycle finishes.
