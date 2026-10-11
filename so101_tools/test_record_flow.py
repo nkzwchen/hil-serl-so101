@@ -153,6 +153,9 @@ class StubEnv(gym.Env):
             'randomized': True, 'dx_m': 0.011, 'dy_m': -0.008, 'dz_m': 0.004,
             'act_tilt_deg': 1.8, 'err_mm': 2.0, 'margin_rad': 1.2}}
 
+    def begin_control_cycle(self):
+        pass  # Stub steps do not sleep; the real environment accounts for inference time.
+
     def step(self, action):
         self.n_steps += 1
         # 让主臂逐步靠近 "从臂 + 偏置"，好让 align_leader 收敛

@@ -26,7 +26,7 @@ class ControlRateTrialTests(unittest.TestCase):
             self.assertEqual(recorder.main(),0)
         self.assertEqual(instances[0].hz,10)
         self.assertEqual(instances[0].max_episode_steps,100)
-        self.assertEqual(config.TrainConfig.ENV_HZ,30)
+        self.assertEqual(config.TrainConfig.ENV_HZ,10)
 
     def test_trial_rate_metadata_and_deadline(self):
         cycles=[];calls=[];instances=[]

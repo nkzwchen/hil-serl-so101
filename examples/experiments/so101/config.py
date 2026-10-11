@@ -58,7 +58,7 @@ class TrainConfig(DefaultTrainingConfig):
     checkpoint_period = 1000
 
     # ---- env 参数 ----
-    ENV_HZ = CONTROL_HZ
+    ENV_HZ = 10.0  # Training/recording cadence; native feedback polling remains CONTROL_HZ=30.
     CONTROL_BACKEND = 'lerobot_native_v1'
     POSE_ALIGNMENT = ALIGNMENT
     # ★ 观测图像边长（两个相机都用它，正方形）。
@@ -79,7 +79,7 @@ class TrainConfig(DefaultTrainingConfig):
     ACTION_JOINTS = list(CONTROLLED_JOINTS)
     ACTION_SEMANTICS = ACTION_SEMANTICS
     OBSERVATION_SEMANTICS = OBSERVATION_SEMANTICS
-    MAX_EPISODE_STEPS = 300         # Preserve the existing 10-second episode budget at 30 Hz.
+    MAX_EPISODE_STEPS = 100         # 10-second demonstration budget at 10 Hz.
     DISPLAY_IMAGE = False           # True 会弹窗显示两路相机
 
     # ---- 起始位置随机化：前三个关节独立 ±1.5°，腕部补偿倾角 ----

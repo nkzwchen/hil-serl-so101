@@ -1,3 +1,62 @@
+## 当前10Hz新训练准备（2026-10-11）
+
+新数据集 `training_data/main10_scale55_20261011`：53段原生10Hz示范1475步＋20个近似转换成功片段129步，共1604步。2段手动排除未纳入。旧checkpoint2083已原样备份在 `checkpoints_archive/30hz_step2083/`，本地/云端SHA一致。新 `--init-from` 复制网络/target权重，重置优化器/回放/计步，必须独立目录；零更新验证参数完全一致。当前TrainConfig默认10Hz、5.5度；旧模型不能直接接新Actor。新训练尚未执行，云端旧服务未修改。数据、命令和限制见 `validation/migration10hz_ready/准备报告.md`。旧的30Hz启动说明为历史记录。
+
+> **单步动作上限更新：5.5°/关节/步。** 新启动录制生效；10Hz下理想请求上限55°/秒，关节位置边界仍有效。已录制的4°数据与标注未修改。旧4°模型会被动作尺度兼容检查拒绝直接运行；旧Actor命令需完成尺度迁移后再使用。训练合并时旧动作必须按原尺度/5.5重新归一化，不能只改元数据；保留旧权重也不等于新尺度下动作物理意义不变。
+
+## 采集30段真实10Hz示范（本地保存，不训练）
+
+```bash
+cd /home/nkzwchen/pi_project
+source so101_env.sh
+export DISPLAY=:0
+python recording_tools/record_demo_so101.py --control-hz 10 --episodes 30 --note demo30_10hz
+```
+
+相机仍使用原启动命令，勿同时启动另一个Actor或ROS机械臂串口桥。窗口C开始、D结束、回程后C保存；采完再人工标注。纯示范每段上限100步，约10秒（沿用原示范时长）；初始位置随机化默认开启。该命令不加载模型、不上传数据。
+
+20段旧候选已复制到 `recordings/migration10hz_selected20_sources/`，原数据及标签哈希保持一致，来源见manifest.json。它们仍为30Hz原件，仅终止窗口通过初筛，尚未转换；后续不能未经转换直接与新30段组成10Hz训练池。
+
+## 10Hz Actor 本地试运行（2026-10-11）
+
+保持现有相机进程和云端 SSH 转发连接，结束旧 Actor 后运行：
+
+```bash
+cd /home/nkzwchen/pi_project
+source so101_env.sh
+export DISPLAY=:0
+python hil-serl/so101_tools/train_human.py actor --trial-control-hz 10 \
+  --record-args --episodes 1 --note control10_trial
+```
+
+从当前云端服务下载兼容的30Hz模型，在本地10Hz试运行。只存本地，不弹自动提交流程、不上传、不进云端训练池；数据如实记录env_hz=10，policy.spec保留源模型30Hz。SPACE接管/交还，D结束，RETURN阶段C保存，控制窗口照常。每步请求上限仍4度，20秒上限200步；串口反馈读取保持30Hz，相机频率不变。推理时间计入100ms周期，超时不追赶补发，实际频率以记录为准。初始归位及20秒内运动仍会真实执行。
+
+原30Hz训练服务/数据不变；不带--trial-control-hz仍按原30Hz流程运行。暂未做10Hz真机验收，不得把10Hz数据改标签混入旧训练池。人工复查可稍后使用label_demos.py。
+
+> **2026-10-11 更新额度调整：新增在线数据按 1.0 周期/transition 更新。** 云端从 step627、累计在线2469步重新设定预算基准；历史数据不补算，batch256、CTA2、discount0.99不变。切换前 checkpoint 和预算已备份到云端 run 下 `before_rate1_20261011_183859/`。服务此次运行上限7200秒，日志 `online_service_rate1.log`。Actor 启动命令不变。
+>
+> 正常恢复请使用 `--updates-per-transition 1.0`，保持 `--continuous --update-schedule data-budget --steps 0`。`--rebase-update-budget` 仅用于明确改变比例的那一次恢复；普通重启不要添加。它保留旧预算剩余额度，并只按新比例计算基准之后的新增在线数据。
+
+> **在线服务时限已延长：** 2026-10-11 从最新 step469 优雅恢复，单次服务时限改为10800秒（3小时）；保留原run_id、经验池和0.25更新额度。早期“一小时”说明为历史配置，以云端learning_config.json为准。
+
+## 当前在线服务（主相机双 ROI，第10步恢复）
+
+2026-10-11 本次服务从正式 checkpoint_10 恢复，batch256、discount0.99、CTA2；data-budget模式，每条新在线经验增加0.25周期；初始追加更新0，等待已标注新数据。最长运行3600秒，到期保存退出。不是benchmark的step22。
+
+```bash
+cd /home/nkzwchen/pi_project
+source so101_env.sh
+export DISPLAY=:0
+python hil-serl/so101_tools/train_human.py status
+python hil-serl/so101_tools/train_human.py actor \
+  --upload-host root@120.209.70.195 --upload-port 30555 \
+  --ssh-control-path /tmp/so101_roi50.sock \
+  --upload-dir /root/gpufree-data/demos/main_roi48_20261011 \
+  --record-args --episodes 1 --note main_roi_online
+```
+
+先启动主相机的 so101_record_cameras.launch.py；不要启动占用原生串口的ROS机械臂桥。actor随机采样，窗口空格接管、D结束、回程C保存、段后人工标注提交。一次运行一段；窗口与机械臂由用户启动。当前SSH会话已转发5688/5689，隧道失效需重建。云端run：`/root/gpufree-data/training_runs/main_roi48_batch256_10updates_20261011`，日志 `online_service.log`。下方其他run和sock路径属于历史示例。
+
 > **最新训练设置：** batch=256、discount=0.99；本地训练 actor 使用随机策略采样（每次 split RNG，保留动作限幅/接管）。`--continuous --update-schedule asynchronous` 持续更新，不受新数据额度限制，`--steps 100` 在该模式不是停止条件。运行时限仍为 `--max-runtime-seconds 3600`；如要严格100轮结束，不加 `--continuous`。旧额度模式可用 `--update-schedule data-budget`。每段边界更新 actor 权重、段后人工奖励不变。
 
 > **2026-10-11 主相机双 ROI 更新：** 录制/训练仅使用 `cam_main`、`cam_main_roi`；仅订阅并启动物理 `cam_main`，不再要求腕部相机。两路保持现有裁剪参数，224×224。合并数据位于 `recordings/2026-10-11_merged_main_roi50`（10+40段，原始目录保留）；标签帧号不变，文件哈希已重建。历史腕部质量诊断留作审计，不能视为当前相机要求。旧三图像 checkpoint 不兼容，请使用新训练目录，不要直接恢复旧权重。配置下次启动生效，本次未启动设备/训练。

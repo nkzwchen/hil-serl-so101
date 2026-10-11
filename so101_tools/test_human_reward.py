@@ -13,6 +13,19 @@ from experiments.so101.human_reward import load_episode
 from coarse_label_demos import coarse_label
 
 class HumanRewardTests(unittest.TestCase):
+    def test_derived_success_requires_contiguous_frame_mapping(self):
+        self.meta['conversion']=dict(version='10hz_scale55_v1',kind='native10_scale_only',
+            source_label=dict(status='success',frame=4,reviewed=True,source='human_review'),
+            source_sha256='source-digest',source_ranges=[[0,1],[1,2],[2,3],[3,4]])
+        self.lab.update(source='derived_human_review',frame=4,source_recording_sha256='source-digest')
+        self.save()
+        ts,_=load_episode(self.path,self.cfg)
+        self.assertEqual(float(ts[-1]['rewards']),1.)
+        self.meta['conversion']['source_ranges'][2]=[2,4]
+        self.save()
+        with self.assertRaisesRegex(ValueError,'discarded'):
+            load_episode(self.path,self.cfg)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

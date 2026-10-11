@@ -88,6 +88,11 @@ def _train_locked(args, out):
     from experiments.so101.human_reward import load_episode
     from online_training import HumanReplay, UpdateBudget, REPLAY_SEMANTICS
     cfg = TrainConfig()
+    cfg.ALLOW_APPROXIMATE_DEMOS = getattr(args, 'allow_approximate_demos', False)
+    if getattr(args, 'init_from', None) and any(out.iterdir()):
+        # The run lock is created before entering this function.
+        if any(p.name != '.learner.lock' for p in out.iterdir()):
+            raise ValueError('Weights-only migration requires an empty new run directory')
     inbox = Path(args.data).resolve()
     replay = HumanReplay(cfg.replay_buffer_capacity)
     previous = {}
@@ -123,7 +128,14 @@ def _train_locked(args, out):
     update_schedule = getattr(args, 'update_schedule', 'data-budget')
     learning = dict(batch_size=batch_size, cta_ratio=cta_ratio, discount=cfg.discount,
                     replay_semantics=REPLAY_SEMANTICS, capacity=cfg.replay_buffer_capacity)
+    if cfg.ALLOW_APPROXIMATE_DEMOS:
+        learning['allow_approximate_demos'] = True
     step = 0
+    initialization = saved.get('initialization')
+    if getattr(args, 'init_from', None):
+        from warm_start import load_weights
+        agent, initialization = load_weights(agent, args.init_from, spec, out)
+        print(f'Weights-only initialization: {initialization}', flush=True)
     if args.resume:
         if saved.get('learning') and saved['learning'] != learning:
             raise ValueError('Resume learning configuration differs; keep batch size/CTA/discount/replay semantics unchanged')
@@ -203,7 +215,7 @@ def _train_locked(args, out):
         with lock:
             persist_receipts()
             atomic_json(Path(str(checkpoint)+'.json'), dict(spec=spec, step=step, run_id=run_id,
-                        learning=learning, budget=budget.state() if continuous else None,
+                        learning=learning, initialization=initialization, budget=budget.state() if continuous else None,
                         sampler_state=rng.bit_generator.state, update_schedule=update_schedule, migrated_from=args.resume))
         atomic_json(out / 'latest.json', dict(checkpoint=str(checkpoint), step=step))
         return checkpoint
@@ -296,7 +308,9 @@ def main():
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--encoder', choices=['resnet','resnet-pretrained'], default='resnet-pretrained')
     ap.add_argument('--allow-provisional', action='store_true')
+    ap.add_argument('--allow-approximate-demos', action='store_true', help='Explicitly admit provenance-checked 30Hz-to-10Hz converted fragments')
     ap.add_argument('--resume')
+    ap.add_argument('--init-from', help='Copy existing params/target weights into a NEW run; reset optimizer/replay/budget')
     ap.add_argument('--serve-seconds', type=int, default=0)
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=5688)
@@ -309,6 +323,8 @@ def main():
     ap.add_argument('--ssh-control-path', help='Optional existing SSH ControlMaster socket')
     ap.add_argument('--record-args', nargs=argparse.REMAINDER, default=[])
     args = ap.parse_args()
+    if args.init_from and (args.mode != 'train' or args.resume):
+        ap.error('--init-from requires train and cannot be combined with --resume')
     if args.trial_control_hz and args.mode != 'actor':
         ap.error('--trial-control-hz is actor-only')
     if args.rebase_update_budget and not (args.mode == 'train' and args.resume and args.continuous and args.update_schedule == 'data-budget' and args.steps == 0):

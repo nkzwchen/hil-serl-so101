@@ -641,7 +641,7 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                     if k in ('h', 'H'):
                         print(f'  [RECORD] {KEYS_BY_PHASE["RECORD"]}')
                         continue
-                    if control_hz is not None:
+                    if env.unwrapped.hz == 10 or control_hz is not None:
                         env.unwrapped.begin_control_cycle()
                     obs = cur_obs(env)
                     obs_quality = env.unwrapped.last_observation_quality()

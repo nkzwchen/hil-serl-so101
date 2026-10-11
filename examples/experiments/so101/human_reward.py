@@ -42,13 +42,35 @@ def load_episode(path, config, allow_provisional=False):
     if lab.get('provisional', False):
         if not allow_provisional:
             raise ValueError('Provisional label requires --allow-provisional')
-    elif not lab.get('reviewed', False) or lab.get('source') != 'human_review':
+    elif not lab.get('reviewed', False) or lab.get('source') not in ('human_review', 'derived_human_review'):
         raise ValueError('Human review required')
     if lab.get('status') not in ('success', 'failed'):
         raise ValueError('Episode must be explicitly labeled success or failed')
     with path.open('rb') as f:
         raw = RecordingUnpickler(f).load()  # Only trusted, user-owned recording files.
     meta, ts = raw['meta'], raw['transitions']
+    if lab.get('source') == 'derived_human_review':
+        conversion = meta.get('conversion', {})
+        original = conversion.get('source_label', {})
+        spans = conversion.get('source_ranges', [])
+        if (conversion.get('version') != '10hz_scale55_v1' or
+            original.get('source') != 'human_review' or not original.get('reviewed') or original.get('provisional') or
+            original.get('status') != lab.get('status') or
+            not conversion.get('source_sha256') or conversion['source_sha256'] != lab.get('source_recording_sha256') or
+            len(spans) != len(ts) or not spans):
+            raise ValueError('Invalid derived label provenance')
+        if any(not isinstance(s, list) or len(s)!=2 or not all(type(i) is int for i in s) or s[0]<0 or s[1]<=s[0] for s in spans):
+            raise ValueError('Invalid source ranges')
+        if any(a[1]!=b[0] for a,b in zip(spans,spans[1:])):
+            raise ValueError('Derived episode crosses discarded source steps')
+        if original['status']=='success' and (spans[-1][1]!=original.get('frame') or lab.get('frame')!=len(ts)):
+            raise ValueError('Derived success frame is misaligned')
+        kind=conversion.get('kind')
+        if kind=='approximate_30hz_success_suffix':
+            if not getattr(config, 'ALLOW_APPROXIMATE_DEMOS', False):
+                raise ValueError('Approximate 30Hz conversion requires --allow-approximate-demos')
+        elif kind!='native10_scale_only':
+            raise ValueError('Unknown conversion kind')
     if meta.get('operator_excluded') or meta.get('recording', {}).get('has_gaps'):
         raise ValueError('Excluded episode or missing recording steps')
     if meta.get('safety_error'):
