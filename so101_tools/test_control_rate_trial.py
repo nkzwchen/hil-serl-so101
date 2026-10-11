@@ -13,6 +13,21 @@ import record_demo_so101 as recorder
 from experiments.so101 import config
 
 class ControlRateTrialTests(unittest.TestCase):
+    def test_demo_cli_rate_dry_run(self):
+        instances=[]
+        class Env(flow.StubEnv):
+            def __init__(self,*a,**kw):
+                super().__init__(*a,**kw);instances.append(self)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(config,'SO101Env',Env), \
+             patch.object(recorder,'NonBlockingKey',return_value=flow.StubKeys([])), \
+             patch.object(sys,'argv',['record','--terminal-controls','--dry-run','--control-hz','10','--out',directory]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(recorder.main(),0)
+        self.assertEqual(instances[0].hz,10)
+        self.assertEqual(instances[0].max_episode_steps,100)
+        self.assertEqual(config.TrainConfig.ENV_HZ,30)
+
     def test_trial_rate_metadata_and_deadline(self):
         cycles=[];calls=[];instances=[]
         class Env(flow.StubEnv):

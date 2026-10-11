@@ -407,7 +407,13 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
     ap.add_argument('--dry-run', action='store_true',
                     help='preflight + print the plan, then exit (no motion)')
     ap.add_argument('--terminal-controls', action='store_true', help='仅使用终端按键，不打开控制窗口')
+    ap.add_argument('--control-hz', type=int, choices=[10, 30],
+                    help='Local demonstration recording rate; actor uses --trial-control-hz instead')
     args = ap.parse_args()
+    if args.control_hz is not None:
+        if policy is not None or on_episode_saved is not None:
+            ap.error('--control-hz is for local demonstrations only; actor uses --trial-control-hz')
+        control_hz = args.control_hz
 
     import rclpy
     from experiments.so101.env import SO101Env
