@@ -1,6 +1,7 @@
 """Separate-process Tk control window. GUI never touches robot or network objects."""
 import multiprocessing as mp
 import time
+from takeover_settings import load_limit, save_limit, validate_limit
 
 PHASES = {
  'CHECK': ('前置检查', '', '正在检查设备，请稍候'),
@@ -78,7 +79,7 @@ def event_key(event):
 def _window(conn):
     try:
         import tkinter as tk
-        root=tk.Tk();root.title('SO101 录制控制');root.geometry('680x430')
+        root=tk.Tk();root.title('SO101 录制控制');root.geometry('740x540')
         def set_text(widget, text, size=18, color='#222'):
             widget._text_image = _text_image(root, text, size, color)
             widget.configure(image=widget._text_image)
@@ -92,6 +93,24 @@ def _window(conn):
         feedback=tk.Label(root);feedback.pack()
         bar=tk.Frame(root);bar.pack(pady=10)
         state={'phase':'CHECK','generation':0,'closing':False}
+        settings=tk.Frame(root);settings.pack(pady=8)
+        settings_label=tk.Label(settings);settings_label.pack()
+        set_text(settings_label,'每段最多接管次数（0 = 不限，仅在线模式）',17)
+        limit_value=tk.StringVar(value=str(load_limit()))
+        limit_input=tk.Spinbox(settings,from_=0,to=999,textvariable=limit_value,width=6)
+        limit_input.pack(side='left',padx=12)
+        def apply_limit():
+            if state['closing'] or state['phase'] not in ('CHECK','PRECISE','READY','RETURN','SAVE','REVIEW'):return
+            try:
+                value=validate_limit(int(limit_value.get()))
+                save_limit(value)
+                conn.send(('settings',value))
+                set_text(feedback,f'已保存：每段最多接管 {value or "不限"} 次；下段开始时生效',16,'#167a55')
+                root.focus_set()
+            except (ValueError,OSError) as exc:
+                set_text(feedback,f'设置未保存：{exc}',16,'#b45309')
+        save_button=tk.Button(settings,command=apply_limit,takefocus=False)
+        set_text(save_button,'保存设置',17);save_button.pack(side='left')
         held=set(); releases={};buttons={}
         def send(key):
             if not state['closing'] and key in PHASES[state['phase']][1]:
@@ -123,11 +142,12 @@ def _window(conn):
             releases.clear();held.clear()
         root.bind('<FocusOut>',clear_held,add='+')
         # Clicking text/background must also restore keyboard focus to this window.
-        root.bind('<Button-1>',lambda event:root.focus_set(),add='+')
+        root.bind('<Button-1>',lambda event:root.focus_set() if event.widget!=limit_input else None,add='+')
         def close():
             state['closing']=True;conn.send(('close',))
             set_text(detail,'已请求退出，等待当前操作返回；不会通过关窗强制终止设备调用。')
             for b in buttons.values():b.configure(state='disabled')
+            limit_input.configure(state='disabled');save_button.configure(state='disabled')
         root.protocol('WM_DELETE_WINDOW',close)
         last_focus=[None]
         def refresh_focus():
@@ -153,13 +173,15 @@ def _window(conn):
                     _,p,g,extra=msg
                     set_text(feedback,'',16)
                     state.update(phase=p,generation=g)
+                    editable=p in ('CHECK','PRECISE','READY','RETURN','SAVE','REVIEW') and not state['closing']
+                    for widget in (limit_input,save_button):widget.configure(state='normal' if editable else 'disabled')
                     set_text(phase,PHASES[p][0],28);set_text(mode,extra,21,'#167a55')
                     if p=='READY':root.lift();root.focus_force()
                     if not state['closing']:set_text(detail,PHASES[p][2])
                     for key,b in buttons.items():b.configure(state='normal' if key in PHASES[p][1] and not state['closing'] else 'disabled')
                 root.after(40,tick)
             except (EOFError,BrokenPipeError):root.destroy()
-        conn.send(('ready',));root.after(40,tick);root.mainloop()
+        conn.send(('ready',load_limit()));root.after(40,tick);root.mainloop()
     except Exception as exc:
         try:conn.send(('error',str(exc)))
         except (EOFError,BrokenPipeError):pass
@@ -176,13 +198,19 @@ class ControlPanel:
         msg=self.conn.recv()
         if msg[0]!='ready':
             self.__exit__();raise RuntimeError(f'控制窗口无法启动：{msg}；可使用 --terminal-controls')
+        self.max_takeovers=validate_limit(msg[1])
         self.ok=True
     def _receive(self):
         if not self.process.is_alive():raise KeyboardInterrupt('Control window exited')
         while self.conn.poll():
             msg=self.conn.recv()
             if msg[0]=='error':raise RuntimeError(msg[1])
+            if msg[0]=='settings':
+                self.max_takeovers=validate_limit(msg[1]);continue
             self.gate.receive(msg)
+    def get_max_takeovers(self):
+        self._receive()
+        return self.max_takeovers
     def check(self):
         self._receive()
         if self.gate.closed:raise KeyboardInterrupt('Control window requested exit')

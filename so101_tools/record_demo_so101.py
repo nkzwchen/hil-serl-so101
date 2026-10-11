@@ -603,7 +603,9 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                 env.unwrapped._step_count = 0
                 kb.drain()
                 kb.reassert()
-                panel_phase(kb, 'RECORD' if policy is not None else 'RECORD_MANUAL', '模型控制' if policy is not None else '人工接管')
+                from takeover_settings import TakeoverBudget
+                takeover_budget = TakeoverBudget(kb.get_max_takeovers() if policy is not None and hasattr(kb,'get_max_takeovers') else 0)
+                panel_phase(kb, 'RECORD' if policy is not None else 'RECORD_MANUAL', takeover_budget.detail(False) if policy is not None else '人工接管')
                 print(f'\n[RECORD] {KEYS_BY_PHASE["RECORD"]}')
                 if policy is not None:
                     print('  SPACE = toggle human intervention; rewards wait for episode annotation')
@@ -626,8 +628,12 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                         done = True
                         break  # Finish existing samples; do not issue an extra control step.
                     if policy is not None and k == ' ':
+                        if takeover_budget.press_space(env.unwrapped.is_intervening):
+                            print(f'  已达本段接管上限 {takeover_budget.limit} 次；本次空格按 D 处理，结束录制并进入人工回程。',flush=True)
+                            done = True
+                            break
                         env.unwrapped.set_intervening(not env.unwrapped.is_intervening)
-                        panel_phase(kb, 'RECORD', '人工接管' if env.unwrapped.is_intervening else '模型控制')
+                        panel_phase(kb, 'RECORD', takeover_budget.detail(env.unwrapped.is_intervening))
                         continue
                     if k in ('q', 'Q'):
                         # 操作失误只标记待排除；原始数据保留，仍进 RETURN。
@@ -797,6 +803,9 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                         'native_feedback_diagnostics': (env.unwrapped.feedback_diagnostics()
                             if hasattr(env.unwrapped, 'feedback_diagnostics') else None),
                         'episode_timeout': episode_timeout,
+                        'max_takeovers': takeover_budget.limit,
+                        'takeover_count': takeover_budget.count,
+                        'takeover_limit_reached': takeover_budget.limit_reached,
                         'episode_time_limit_s': ACTOR_EPISODE_SECONDS if policy is not None else None,
                         'policy': getattr(policy, 'metadata', None),
                         'capture_policy': 'retain_all_with_quality_flags_v1',
