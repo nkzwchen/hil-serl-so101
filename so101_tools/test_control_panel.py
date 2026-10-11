@@ -3,19 +3,26 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
-from control_panel import KeyGate
+from control_panel import KeyGate, event_key
 from label_demos import Labeler
 
 
 class PanelTests(unittest.TestCase):
-    def test_old_phase_and_stale_keys_ignored(self):
+    def test_release_without_char_matches_press(self):
+        self.assertEqual(event_key(SimpleNamespace(keysym='c',char='c')), 'c')
+        self.assertEqual(event_key(SimpleNamespace(keysym='c',char='')), 'c')
+        self.assertEqual(event_key(SimpleNamespace(keysym='C',char='')), 'c')
+        self.assertEqual(event_key(SimpleNamespace(keysym='space',char='')), ' ')
+
+    def test_old_phase_ignored_same_phase_delayed_key_retained(self):
         g=KeyGate();g.set_phase('READY')
         old=g.generation;g.set_phase('RETURN')
-        for gen,stamp in [(old,time.monotonic()),(g.generation,time.monotonic()-2)]:
+        for gen,stamp in [(old,time.monotonic()),(old,time.monotonic()-2)]:
             g.receive(('key',gen,stamp,'c'))
         self.assertIsNone(g.read())
-        g.receive(('key',g.generation,time.monotonic(),'c'))
+        g.receive(('key',g.generation,time.monotonic()-2,'c'))
         self.assertEqual(g.read(),'c')
+        self.assertGreaterEqual(g.events[-1]['dispatch_latency_ms'],2000)
         self.assertIsNone(g.read())
 
     def test_upload_keys_disabled_close_persists(self):

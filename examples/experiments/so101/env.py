@@ -216,7 +216,7 @@ class SO101Env(gym.Env):
         self.create_sub = self.node.create_subscription
         self.create_sub(JointState, '/follower/joint_states', self._on_joint, qos_js)
         self.create_sub(JointState, '/leader/joint_states', self._on_leader, qos_js)
-        for cam in ('cam_main', 'cam_wrist'):
+        for cam in CAMERA_KEYS:
             self.create_sub(
                 Image, f'/follower/{cam}/image_raw',
                 lambda msg, k=cam: self._on_image(msg, k), qos_img,
@@ -704,7 +704,7 @@ class SO101Env(gym.Env):
             images[cam] = imgs.get(cam, np.zeros((self.img_size, self.img_size, 3), np.uint8))
         if self.display_image:
             try:
-                show = np.concatenate([images['cam_main'], images['cam_wrist']], axis=1)
+                show = np.concatenate([images[k] for k in self.image_keys], axis=1)
                 cv2.imshow('so101_env', show[:, :, ::-1])   # 显示要 BGR
                 cv2.waitKey(1)
             except Exception:

@@ -125,7 +125,7 @@ class StubEnv(gym.Env):
         return {'ok': True, 'problems': [], 'cameras': {
             k: {'source_stamp_ns': self._tick, 'errors': 0, 'age_s': 0.,
                 'arrival': time.monotonic(), 'fps': 30.}
-            for k in ('cam_main', 'cam_wrist')}}
+            for k in ('cam_main',)}}
 
     def last_observation_quality(self):
         return self._last_quality
@@ -138,7 +138,7 @@ class StubEnv(gym.Env):
         # ★ 返回**嵌套**形态、图像**不带**前导维 —— 与真 SO101Env 一致；
         #   拍平和加前导维是 SERLObsWrapper/ChunkingWrapper 的事。
         base = np.full((IMG, IMG, 3), self._tick % 251, dtype=np.uint8)
-        self._images = {'cam_main': base.copy(), 'cam_wrist': (base + 7).copy()}
+        self._images = {'cam_main': base.copy(), 'cam_main_roi': (base + 7).copy()}
         return {'state': {'joint_pos': self.joint_pos.copy(),
                           'joint_vel': np.zeros(N_ARM + 1, dtype=np.float32),
                           'command_error':np.zeros(N_ACTION,np.float32), 'hold_offset':np.zeros(N_ACTION,np.float32)},
@@ -192,7 +192,7 @@ def _obs_space():
             'hold_offset':gym.spaces.Box(-np.inf,np.inf,(N_ACTION,),dtype=f32)}),
         'images': gym.spaces.Dict({
             'cam_main': gym.spaces.Box(0, 255, (IMG, IMG, 3), dtype=np.uint8),
-            'cam_wrist': gym.spaces.Box(0, 255, (IMG, IMG, 3), dtype=np.uint8)}),
+            'cam_main_roi': gym.spaces.Box(0, 255, (IMG, IMG, 3), dtype=np.uint8)}),
     })
 
 

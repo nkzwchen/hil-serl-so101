@@ -31,7 +31,7 @@ from experiments.so101.so101_home_pose import N_ACTION, N_ALL, CONTROLLED_JOINTS
 
 class TrainConfig(DefaultTrainingConfig):
     # ---- 观测 ----
-    image_keys = ['cam_main', 'cam_wrist']
+    image_keys = ['cam_main', 'cam_main_roi']
     classifier_keys = []          # 奖励只来自段后人工标注
     proprio_keys = ['joint_pos', 'joint_vel', 'command_error', 'hold_offset']   # 无 tcp_force/tcp_torque
 
@@ -97,8 +97,9 @@ class TrainConfig(DefaultTrainingConfig):
     def __init__(self):
         self.roi_spec = load_roi()
         self.main_roi_spec = load_main_roi()
-        self.image_keys = ['cam_main', 'cam_wrist'] + (
-            ['cam_main_roi'] if self.roi_spec else [])
+        if not self.roi_spec or not self.main_roi_spec:
+            raise ValueError('Both cam_main ROI specifications are required')
+        self.image_keys = ['cam_main', 'cam_main_roi']
 
     def get_environment(self, fake_env=False, save_video=False, classifier=False,
                         enable_keyboard=True, randomize_start=None):

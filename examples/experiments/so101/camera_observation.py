@@ -7,7 +7,7 @@ import numpy as np
 
 DEFAULT_ROI_PATH = Path(__file__).with_name('cam_main_roi.json')
 MAIN_ROI_PATH = Path(__file__).with_name('cam_main_view_roi.json')
-CAMERA_KEYS = ('cam_main', 'cam_wrist')
+CAMERA_KEYS = ('cam_main',)
 
 
 def decode_rgb(msg):

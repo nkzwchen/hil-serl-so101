@@ -492,6 +492,7 @@ def main(policy=None, on_episode_saved=None):
             ep, quit_now = 0, False
             attempt, n_discarded = 0, 0
             while ep < args.episodes and not quit_now:
+                key_timing_start = len(kb.timing_events()) if hasattr(kb, 'timing_events') else 0
                 if hasattr(kb, 'check'):kb.check()
                 panel_phase(kb, 'PRECISE', f'第 {ep+1}/{args.episodes} 段')
                 attempt += 1
@@ -605,11 +606,16 @@ def main(policy=None, on_episode_saved=None):
                 camera_repeat_streak = {}
                 safety_error = None
                 done, truncated = False, False
+                pending_record_key = None
                 while not done:
                     if actor_deadline_expired(deadline):
                         episode_timeout = truncated = True
                         break
-                    k = poll(kb, 'dDqQxXhH ')
+                    k = pending_record_key if pending_record_key is not None else poll(kb, 'dDqQxXhH ')
+                    pending_record_key = None
+                    if k in ('d', 'D'):
+                        done = True
+                        break  # Finish existing samples; do not issue an extra control step.
                     if policy is not None and k == ' ':
                         env.unwrapped.set_intervening(not env.unwrapped.is_intervening)
                         panel_phase(kb, 'RECORD', '人工接管' if env.unwrapped.is_intervening else '模型控制')
@@ -637,7 +643,15 @@ def main(policy=None, on_episode_saved=None):
                         if actor_deadline_expired(deadline):
                             episode_timeout = truncated = True
                             break  # Inference finished too late: do not send its action.
+                        # A key can arrive while inference blocks. Discard that policy
+                        # request and handle the key before issuing any new command.
+                        if policy is not None:
+                            pending_record_key = poll(kb, 'dDqQxXhH ')
+                            if pending_record_key is not None:
+                                continue
                         next_obs, rew, env_done, trunc, info = env.step(requested)
+                        if hasattr(kb, 'mark_control_step'):
+                            kb.mark_control_step(bool(env.unwrapped.is_intervening))
                     except (RuntimeError, KeyboardInterrupt) as exc:
                         safety_error = f'{type(exc).__name__}: {exc}'
                         quit_now = truncated = True
@@ -674,8 +688,6 @@ def main(policy=None, on_episode_saved=None):
                     act = info.get('intervene_action', requested)
                     itv = bool(info.get('intervening', False))
                     n_itv += int(itv)
-                    if k in ('d', 'D'):
-                        done = True                  # 人按 d：本段到此为止
                     if env_done and k not in ('d', 'D'):
                         # env 自己结束的（步数预算用满 / 判成功）—— 说清楚，
                         # 免得看起来像"按了 d 就没了"。踩坑：对齐阶段耗掉的
@@ -769,6 +781,7 @@ def main(policy=None, on_episode_saved=None):
                               safety_error=safety_error)
                 panel_phase(kb, 'SAVE')
                 saved_meta = recorder.finish({
+                        'control_key_timings': kb.timing_events()[key_timing_start:] if hasattr(kb, 'timing_events') else [],
                         'index': ep, 'start_info': st,
                         'native_feedback_diagnostics': (env.unwrapped.feedback_diagnostics()
                             if hasattr(env.unwrapped, 'feedback_diagnostics') else None),
