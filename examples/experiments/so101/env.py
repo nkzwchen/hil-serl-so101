@@ -1062,8 +1062,16 @@ class SO101Env(gym.Env):
         """Expert and policy both store normalized requested relative joint increments."""
         return self._last_joint_action.copy() if self.is_intervening else None
 
+    def begin_control_cycle(self):
+        """Include caller observation/inference time in the next step's period."""
+        self._caller_cycle_started = time.monotonic()
+
     def step(self, action: np.ndarray):
         step_started = time.monotonic()
+        cycle_started = getattr(self, '_caller_cycle_started', None)
+        self._caller_cycle_started = None
+        if cycle_started is None:
+            cycle_started = step_started
         delta = bounded_joint_delta(action, self.action_scale)
         cur = self.joint_pos
         if cur is None or not np.all(np.isfinite(cur)) or time.monotonic() - self._joint_stamp > .25:
@@ -1111,7 +1119,7 @@ class SO101Env(gym.Env):
             self._drive_leader(cur)
 
         # 维持控制周期
-        time.sleep(max(0., 1.0 / self.hz - (time.monotonic() - step_started)))
+        time.sleep(max(0., 1.0 / self.hz - (time.monotonic() - cycle_started)))
 
         obs = self._get_obs()
         reward = self.compute_reward(obs)

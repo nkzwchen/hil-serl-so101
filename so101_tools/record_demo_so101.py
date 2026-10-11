@@ -393,7 +393,7 @@ def actor_deadline_expired(deadline):
     return deadline is not None and time.monotonic() >= deadline
 
 
-def main(policy=None, on_episode_saved=None):
+def main(policy=None, on_episode_saved=None, control_hz=None):
     delivery_failed = False
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='recordings', help='session parent directory')
@@ -414,6 +414,9 @@ def main(policy=None, on_episode_saved=None):
     from experiments.so101.config import TrainConfig
 
     cfg = TrainConfig()
+    if control_hz is not None:
+        cfg.MAX_EPISODE_STEPS = math.ceil(cfg.MAX_EPISODE_STEPS / cfg.ENV_HZ * control_hz)
+        cfg.ENV_HZ = float(control_hz)
     rclpy.init()
     # ★★ 必须走 TrainConfig().get_environment()，拿**包装后**的 env ★★
     #   裸 SO101Env 的观测是嵌套的 {'state': {...}, 'images': {...}}，而训练侧要的是
@@ -632,6 +635,8 @@ def main(policy=None, on_episode_saved=None):
                     if k in ('h', 'H'):
                         print(f'  [RECORD] {KEYS_BY_PHASE["RECORD"]}')
                         continue
+                    if control_hz is not None:
+                        env.unwrapped.begin_control_cycle()
                     obs = cur_obs(env)
                     obs_quality = env.unwrapped.last_observation_quality()
                     try:

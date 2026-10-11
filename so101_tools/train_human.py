@@ -301,12 +301,16 @@ def main():
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=5688)
     ap.add_argument('--file')
+    ap.add_argument('--trial-control-hz', type=int, choices=[10],
+                    help='Actor-only local 10 Hz trial using existing weights; no upload or submission')
     ap.add_argument('--upload-host', help='SSH user@host for automatic episode upload')
     ap.add_argument('--upload-port', type=int, default=22)
     ap.add_argument('--upload-dir', help='Absolute cloud learner --data directory')
     ap.add_argument('--ssh-control-path', help='Optional existing SSH ControlMaster socket')
     ap.add_argument('--record-args', nargs=argparse.REMAINDER, default=[])
     args = ap.parse_args()
+    if args.trial_control_hz and args.mode != 'actor':
+        ap.error('--trial-control-hz is actor-only')
     if args.rebase_update_budget and not (args.mode == 'train' and args.resume and args.continuous and args.update_schedule == 'data-budget' and args.steps == 0):
         ap.error('--rebase-update-budget requires train --resume --continuous --update-schedule data-budget --steps 0')
     if args.steps < 0 or (args.batch_size is not None and args.batch_size < 2) or (args.cta_ratio is not None and args.cta_ratio < 1) or args.serve_seconds < 0 or args.checkpoint_every < 1:
@@ -318,7 +322,7 @@ def main():
         train(args)
         return
     delivery = None
-    if args.mode in ('actor', 'retry-delivery'):
+    if args.mode in ('actor', 'retry-delivery') and not args.trial_control_hz:
         if not args.upload_host or not args.upload_dir:
             ap.error('actor/retry-delivery requires --upload-host and --upload-dir')
         if args.mode == 'retry-delivery' and not args.file:
@@ -329,7 +333,7 @@ def main():
         uploader.check()  # Before any hardware is opened.
     c = client(args)
     try:
-        if args.mode in ('actor', 'retry-delivery'):
+        if args.mode in ('actor', 'retry-delivery') and not args.trial_control_hz:
             delivery = EpisodeDelivery(TrainConfig(), uploader, lambda name: c.request('submit', {'file': name}))
         if args.mode == 'retry-delivery':
             status_path = Path(args.file).with_suffix('.delivery.json')
@@ -355,6 +359,9 @@ def main():
                                       roi_spec=cfg.roi_spec, main_roi_spec=cfg.main_roi_spec).items():
                 if result['spec'].get(key) != expected:
                     raise ValueError(f'Policy configuration mismatch: {key}')
+            # Validate the source model normally; rate override is explicitly local-only.
+            if args.trial_control_hz:
+                cfg.ENV_HZ = args.trial_control_hz
             agent = make_agent(args,cfg)
             agent = agent.replace(state=agent.state.replace(params=jax.device_put(result.pop('params'))))
             if args.file and args.mode == 'policy-check':
@@ -381,7 +388,9 @@ def main():
                 # Initial download precedes hardware; refresh only at RECORD boundaries.
                 import record_demo_so101
                 sys.argv = ['record_demo_so101.py', *args.record_args]
-                print('Policy loaded. SPACE toggles intervention. Each saved episode opens human review, then uploads.', flush=True)
+                print('Policy loaded. SPACE toggles intervention. ' +
+                      ('10 Hz trial: local recording only; no upload/submission.' if args.trial_control_hz else
+                       'Each saved episode opens human review, then uploads.'), flush=True)
                 from online_training import EpisodePolicy
                 def apply_policy(candidate):
                     nonlocal agent
@@ -399,7 +408,9 @@ def main():
                     sample_policy,
                     lambda meta: c.request('policy', {k:meta.get(k) for k in ('step','run_id')}),
                     apply_policy)
-                rc = record_demo_so101.main(policy=policy, on_episode_saved=delivery.process)
+                rc = record_demo_so101.main(policy=policy,
+                    on_episode_saved=delivery.process if delivery is not None else None,
+                    control_hz=args.trial_control_hz)
                 if rc:
                     raise RuntimeError(f'Actor stopped (exit {rc}); raw files and delivery status retained')
                 result = dict(ok=True, initial_policy_step=result['step'],
