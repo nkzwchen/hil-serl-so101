@@ -42,16 +42,23 @@ class HumanReplay:
 
 class UpdateBudget:
     """One credit = cta_ratio critic updates and one actor/temperature update."""
-    def __init__(self, base_step, initial_updates, updates_per_transition):
+    def __init__(self, base_step, initial_updates, updates_per_transition, online_offset=0):
         if initial_updates < 0 or not math.isfinite(updates_per_transition) or updates_per_transition < 0:
             raise ValueError('Invalid update budget')
         self.base_step = base_step
         self.initial_updates = initial_updates
         self.updates_per_transition = updates_per_transition
+        if online_offset < 0:
+            raise ValueError('Invalid online offset')
+        self.online_offset = online_offset
 
     def remaining(self, step, online_received):
         return max(0, self.base_step + self.initial_updates +
-                   math.floor(online_received*self.updates_per_transition) - step)
+                   math.floor(max(0, online_received-self.online_offset)*self.updates_per_transition) - step)
+
+    def rebase(self, step, online_received, rate):
+        """Keep outstanding old credits; apply the new rate only to future data."""
+        return UpdateBudget(step, self.remaining(step, online_received), rate, online_received)
 
     def state(self):
         return vars(self).copy()

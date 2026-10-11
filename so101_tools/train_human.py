@@ -136,8 +136,14 @@ def _train_locked(args, out):
     budget = UpdateBudget(step, args.steps, getattr(args, 'updates_per_transition', .25))
     if continuous and update_schedule == 'data-budget' and saved.get('budget'):
         budget = UpdateBudget(**saved['budget'])
-        if budget.updates_per_transition != args.updates_per_transition:
+        if getattr(args, 'rebase_update_budget', False):
+            boundary = sum(r['transitions'] for r in previous.values() if r.get('role') == 'online')
+            budget = budget.rebase(step, boundary, args.updates_per_transition)
+            print(f'Rebased update budget at step {step}: {budget.state()}', flush=True)
+        elif budget.updates_per_transition != args.updates_per_transition:
             raise ValueError('Resume must keep updates-per-transition; stored budget is authoritative')
+    elif getattr(args, 'rebase_update_budget', False):
+        raise ValueError('Rebase requires a saved data budget')
     run_id = saved.get('run_id', str(out))
     rng = np.random.default_rng(args.seed)
     if saved.get('sampler_state'):
@@ -159,6 +165,7 @@ def _train_locked(args, out):
                     episodes=len(replay.receipts), learning=learning, continuous=continuous,
                     updates_remaining=budget.remaining(step, replay.online_received) if continuous and update_schedule=='data-budget' else None,
                     update_schedule=update_schedule,
+                    budget=budget.state(),
                     spec=spec)
     def callback(kind, payload):
         try:
@@ -281,6 +288,8 @@ def main():
     ap.add_argument('--update-schedule', choices=['asynchronous','data-budget'], default='asynchronous',
                     help='Continuous mode: train continuously or wait for reviewed-data credits')
     ap.add_argument('--updates-per-transition', type=float, default=.25)
+    ap.add_argument('--rebase-update-budget', action='store_true',
+                    help='Explicit resume-only rate change: preserve pending credits; new rate applies only after saved receipts')
     ap.add_argument('--max-runtime-seconds', type=float, default=3600)
     ap.add_argument('--migrate-replay-semantics', action='store_true')
     ap.add_argument('--checkpoint-every', type=int, default=100)
@@ -298,6 +307,8 @@ def main():
     ap.add_argument('--ssh-control-path', help='Optional existing SSH ControlMaster socket')
     ap.add_argument('--record-args', nargs=argparse.REMAINDER, default=[])
     args = ap.parse_args()
+    if args.rebase_update_budget and not (args.mode == 'train' and args.resume and args.continuous and args.update_schedule == 'data-budget' and args.steps == 0):
+        ap.error('--rebase-update-budget requires train --resume --continuous --update-schedule data-budget --steps 0')
     if args.steps < 0 or (args.batch_size is not None and args.batch_size < 2) or (args.cta_ratio is not None and args.cta_ratio < 1) or args.serve_seconds < 0 or args.checkpoint_every < 1:
         ap.error('Invalid counts')
     import math

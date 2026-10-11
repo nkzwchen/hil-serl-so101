@@ -36,6 +36,20 @@ class OnlineTests(unittest.TestCase):
         self.assertEqual(resumed.remaining(171,285),0)
         self.assertEqual(resumed.remaining(171,289),1)
 
+    def test_rate_change_does_not_recredit_history(self):
+        old = UpdateBudget(10, 0, .25)
+        new = old.rebase(627, 2469, 1.0)
+        self.assertEqual(new.remaining(627, 2469), 0)
+        self.assertEqual(new.remaining(627, 2569), 100)
+        restored = UpdateBudget(**new.state())
+        self.assertEqual(restored.remaining(727, 2569), 0)
+        self.assertEqual(restored.remaining(727, 2570), 1)
+
+    def test_rate_change_preserves_pending_credits(self):
+        new = UpdateBudget(10, 0, .25).rebase(600, 2469, 1.0)
+        self.assertEqual(new.remaining(600, 2469), 27)
+        self.assertEqual(new.remaining(600, 2474), 32)
+
     def test_policy_only_fetches_at_boundary(self):
         calls=[];applied=[]
         old=dict(ok=True,step=1,spec={},run_id='run')
