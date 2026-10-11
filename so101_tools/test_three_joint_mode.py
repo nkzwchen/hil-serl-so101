@@ -2,13 +2,15 @@
 from pathlib import Path
 import sys
 import threading
+import time
+from collections import deque
 from types import SimpleNamespace
 import unittest
 import numpy as np
 root=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(root/'examples'))
 sys.path.insert(0,str(root/'examples/experiments/so101'))
-from joint_control import bounded_joint_delta,execute_joint_request,PROPRIO_DIMS,ACTION_SEMANTICS
+from joint_control import bounded_joint_delta,execute_joint_request,PROPRIO_DIMS,ACTION_SEMANTICS,DEFAULT_STEP_RAD
 from native_io import NativeJointIO
 from so101_home_pose import CONTROLLED_JOINTS,FROZEN_JOINTS,START_JOINT_POSE,randomize_joint_start_pose
 from experiments.so101.config import TrainConfig
@@ -28,12 +30,21 @@ class ThreeJointTests(unittest.TestCase):
     def test_policy_and_human_share_three_dimensional_executor(self):
         request=np.array([.1,-.3,.2]);zeros=np.zeros(3)
         policy,status=execute_joint_request(zeros,zeros,zeros,request,-np.ones(3),np.ones(3))
-        human,hstatus=execute_joint_request(zeros,zeros,zeros,np.array(status['requested_delta_rad'])/np.radians(4),-np.ones(3),np.ones(3))
+        human,hstatus=execute_joint_request(zeros,zeros,zeros,np.array(status['requested_delta_rad'])/DEFAULT_STEP_RAD,-np.ones(3),np.ones(3))
         np.testing.assert_allclose(policy,human)
         self.assertEqual(len(hstatus['target_rad']),3)
 
+    def test_55_degree_request_preserves_joint_bounds(self):
+        z=np.zeros(3)
+        target,status=execute_joint_request(z,z,z,[2,-2,1],np.radians([-90,-90,-90]),np.radians([90,90,3]))
+        np.testing.assert_allclose(np.degrees(target),[5.5,-5.5,3])
+        self.assertIn('joint_limit',status['joint_reasons'][2])
+        self.assertAlmostEqual(np.degrees(TrainConfig.ACTION_SCALE),5.5)
+
     def test_serial_normal_send_excludes_all_frozen_joints(self):
         io=NativeJointIO.__new__(NativeJointIO);io.lock=threading.RLock();io.last_send={}
+        io._diagnostic_lock=threading.Lock();io._io_events=deque(maxlen=64)
+        io._last_read_stamp={'follower':time.monotonic()}
         writes=[]
         def send(action):writes.append(action);return action
         io.robots={'follower':SimpleNamespace(send_action=send)}

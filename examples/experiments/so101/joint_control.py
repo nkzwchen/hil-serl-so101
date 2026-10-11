@@ -5,7 +5,7 @@ ACTION_SEMANTICS = 'relative_joint_target_request_v4_3d'
 OBSERVATION_SEMANTICS = 'joint_command_state_v4_3d'
 PROPRIO_DIMS = dict(joint_pos=6, joint_vel=6, command_error=3, hold_offset=3)
 ACTION_DIM = 3
-DEFAULT_STEP_RAD = float(np.radians(4.))
+DEFAULT_STEP_RAD = float(np.radians(5.5))
 CONTROL_HZ = 30.0
 
 

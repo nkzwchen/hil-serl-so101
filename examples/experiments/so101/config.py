@@ -75,7 +75,7 @@ class TrainConfig(DefaultTrainingConfig):
     #     · 224 也是 ImageNet 预训练 ResNet 的标准输入尺度
     #   cam_main 其实能给更高；将来若要分相机设置，改这里 + env 的 image_sizes。
     IMAGE_SIZE = 224
-    ACTION_SCALE = DEFAULT_STEP_RAD  # 4 degrees/request, covering approved 30 Hz trace max 3.69 degrees
+    ACTION_SCALE = DEFAULT_STEP_RAD  # 5.5 degrees per joint/request; recordings retain their original scale.
     ACTION_JOINTS = list(CONTROLLED_JOINTS)
     ACTION_SEMANTICS = ACTION_SEMANTICS
     OBSERVATION_SEMANTICS = OBSERVATION_SEMANTICS
