@@ -173,6 +173,7 @@ class Labeler:
         self.root = root
         self.review_once = review_once
         self.review_confirmed = False
+        self.review_skipped = False
         self.paths = list(paths)
         self.fi = 0                     # 当前文件下标
         self.episodes = []
@@ -278,6 +279,10 @@ class Labeler:
         _btn('next ep (n) >', lambda: self._step_ep(+1), 11)
         _btn('confirm + submit (w)' if self.review_once else 'save (w)', self._save, 19 if self.review_once else 10)
 
+        if self.review_once:
+            tk.Button(self.root, text='仅保留本地，跳过上传 (u)', command=self._skip_upload,
+                      font=('sans-serif', 12)).pack(pady=5)
+
         self.lbl_info = tk.Label(self.root, text='', bg=BG, fg=FG, justify='left',
                                  anchor='w', font=('DejaVu Sans Mono', 10))
         self.lbl_info.pack(fill='x', padx=10)
@@ -292,10 +297,12 @@ class Labeler:
                 's: mark SUCCESS at this frame   f: mark this episode FAILED   c: clear\n'
                 'n/p: next/prev episode    z/Z: zoom out/in    r: recenter zoom\n'
                 't: switch zoom source    g: nearest/bilinear    click/drag = move zoom\n'
-                'w: save labels    q: quit (auto-saves if anything was marked)')
+                'w: save / confirm    u: skip upload (review mode)    q: close without submitting')
 
     def _bind(self):
         r = self.root
+        if self.review_once:
+            r.bind('u', lambda e: self._skip_upload())
         r.bind('<Left>', lambda e: self._step(-1))
         r.bind('<Right>', lambda e: self._step(+1))
         r.bind('<Shift-Left>', lambda e: self._step(-10))
@@ -684,8 +691,7 @@ class Labeler:
         if self.review_once and not quiet:
             lab = self.labels.get(0, {})
             if not lab.get('reviewed') or lab.get('provisional') or lab.get('status') not in ('success', 'failed'):
-                from tkinter import messagebox
-                messagebox.showinfo('待人工确认', '请先标记成功帧或失败，再按 w 确认提交。')
+                self.lbl_info.configure(text='请先按 s 标记成功帧，或按 f 标记失败，再按 w 确认。\n不想上传本段，可按 u 仅保留本地。', fg='#ffb454')
                 return
         out = {
             'recording': os.path.abspath(path),
@@ -705,6 +711,15 @@ class Labeler:
                 self.review_confirmed = True
                 self.root.destroy()
         return lp
+
+    def _skip_upload(self):
+        if not self.review_once:
+            return
+        if self.labels:
+            self._save(quiet=True)
+        self.review_skipped = True
+        print('  本段仅保留本地，跳过上传。', flush=True)
+        self.root.destroy()
 
     def _quit(self):
         if self.review_once:
@@ -755,6 +770,8 @@ def main():
         print(f'ERROR: startup failed: {type(e).__name__}: {e}')
         return 1
     root.mainloop()
+    if args.review_once and app.review_skipped:
+        return 4  # Explicit local-only choice, distinct from cancel/quit.
     return 0 if not args.review_once or app.review_confirmed else 3
 
 

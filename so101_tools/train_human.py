@@ -318,7 +318,7 @@ def main():
         if args.mode == 'retry-delivery':
             status_path = Path(args.file).with_suffix('.delivery.json')
             status = json.loads(status_path.read_text()) if status_path.exists() else {}
-            needs_review = status.get('status', 'pending_label') == 'pending_label'
+            needs_review = status.get('status', 'pending_label') in ('pending_label', 'skipped')
             if not delivery.process(args.file, review=needs_review):
                 raise RuntimeError('Pending delivery retained; see .delivery.json')
             return

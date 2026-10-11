@@ -317,7 +317,7 @@ def main(inject_camera_failure=False, inject_repeat=False, inject_safety_error=F
     rclpy.try_shutdown = lambda *a, **k: None
 
     argv = sys.argv
-    sys.argv = ['record_demo_so101.py', '--out', tmp, '--episodes', '2', '--note', 'test']
+    sys.argv = ['record_demo_so101.py', '--terminal-controls', '--out', tmp, '--episodes', '2', '--note', 'test']
     if mark_short:
         sys.argv += ['--min-steps', '100']
     try:

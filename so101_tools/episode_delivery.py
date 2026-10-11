@@ -63,8 +63,12 @@ finally:
 def review_window(path):
     env = os.environ.copy()
     env.setdefault('DISPLAY', ':0')
-    subprocess.run([sys.executable, str(Path(__file__).with_name('label_demos.py')),
-                    '--review-once', str(path)], env=env, check=True)
+    result = subprocess.run([sys.executable, str(Path(__file__).with_name('label_demos.py')),
+                    '--review-once', str(path)], env=env, check=False)
+    if result.returncode == 4:
+        return 'skip'
+    result.check_returncode()
+    return 'submit'
 
 
 class EpisodeDelivery:
@@ -83,11 +87,18 @@ class EpisodeDelivery:
             return True
         if status_path.exists():
             status = json.loads(status_path.read_text())
+        if status.get('status') == 'skipped' and not review:
+            print('本段已选择跳过上传；如需补交，请显式重新复核。', flush=True)
+            return True
         try:
             write_status(status_path, status)
             if review and status.get('status') != 'submitted':
                 print('控制暂停：请在窗口中标成功帧或失败，按 w 确认并提交。', flush=True)
-                self.reviewer(path)
+                if self.reviewer(path) == 'skip':
+                    status.update(status='skipped', error=None)
+                    write_status(status_path, status)
+                    print('本段已跳过上传，仅保留本地；可继续下一段。', flush=True)
+                    return True
             transitions, receipt = load_episode(path, self.config, allow_provisional=False)
             del transitions
             if status.get('status') == 'submitted' and status.get('id') == receipt['id']:

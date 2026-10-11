@@ -168,7 +168,7 @@ def preflight(args, env, kb):
 
     # 2) a TTY is mandatory: without it there are no phase keys
     if not kb.ok:
-        bad.append('stdin 不是 TTY → 读不到按键，无法录制。\n'
+        bad.append('控制窗口或终端不可用，无法读取按键。\n'
                    '      → 在**交互式终端**里直接运行本脚本（不要用管道/重定向）。')
 
     # 3) joint states fresh
@@ -219,6 +219,11 @@ def preflight(args, env, kb):
 
 
 # ===================================================================== helpers
+def panel_phase(kb, phase, detail=''):
+    if hasattr(kb, 'set_phase'):
+        kb.set_phase(phase, detail)
+
+
 def poll(kb, accept):
     """Read one key, but only CONSUME it if it is in `accept`.
 
@@ -401,6 +406,7 @@ def main(policy=None, on_episode_saved=None):
                     help='debug: fixed start pose instead of randomizing')
     ap.add_argument('--dry-run', action='store_true',
                     help='preflight + print the plan, then exit (no motion)')
+    ap.add_argument('--terminal-controls', action='store_true', help='仅使用终端按键，不打开控制窗口')
     args = ap.parse_args()
 
     import rclpy
@@ -424,7 +430,9 @@ def main(policy=None, on_episode_saved=None):
         env.unwrapped.max_episode_steps = math.ceil(ACTOR_EPISODE_SECONDS * env.unwrapped.hz)
     recorder = None
     try:
-        with NonBlockingKey() as kb:
+        from control_panel import ControlPanel
+        with (NonBlockingKey() if args.terminal_controls else ControlPanel()) as kb:
+            panel_phase(kb, 'CHECK')
             print_banner(env, args)
             print('\n前置检查 ...')
             bad, _ = preflight(args, env, kb)
@@ -484,6 +492,8 @@ def main(policy=None, on_episode_saved=None):
             ep, quit_now = 0, False
             attempt, n_discarded = 0, 0
             while ep < args.episodes and not quit_now:
+                if hasattr(kb, 'check'):kb.check()
+                panel_phase(kb, 'PRECISE', f'第 {ep+1}/{args.episodes} 段')
                 attempt += 1
                 discard, redo = False, False
                 quality_failed = False
@@ -529,6 +539,7 @@ def main(policy=None, on_episode_saved=None):
 
                 # ---------------- READY ----------------
                 kb.reassert()      # ★ Ctrl-Z + fg 会把终端退回 canonical，重设一次
+                panel_phase(kb, 'READY', f'第 {ep+1}/{args.episodes} 段 · 主臂有力矩')
                 print(f'\n[READY] {KEYS_BY_PHASE["READY"]}')
                 print('  ⚠️ 手离开主臂（模式 A 下主臂有力矩，会自己动）')
                 t_wait = time.time()
@@ -559,7 +570,9 @@ def main(policy=None, on_episode_saved=None):
 
                 if policy is not None and hasattr(policy, 'before_episode'):
                     # READY has completed, no control step is in flight; deadline starts later.
+                    panel_phase(kb, 'POLICY')
                     policy.before_episode()
+                    if hasattr(kb, 'check'):kb.check()
 
                 # Refresh after the operator's READY wait without issuing a motor command.
                 # TrainConfig fixes this chain to ChunkingWrapper(SERLObsWrapper(raw)).
@@ -580,6 +593,7 @@ def main(policy=None, on_episode_saved=None):
                 env.unwrapped._step_count = 0
                 kb.drain()
                 kb.reassert()
+                panel_phase(kb, 'RECORD' if policy is not None else 'RECORD_MANUAL', '模型控制' if policy is not None else '人工接管')
                 print(f'\n[RECORD] {KEYS_BY_PHASE["RECORD"]}')
                 if policy is not None:
                     print('  SPACE = toggle human intervention; rewards wait for episode annotation')
@@ -598,6 +612,7 @@ def main(policy=None, on_episode_saved=None):
                     k = poll(kb, 'dDqQxXhH ')
                     if policy is not None and k == ' ':
                         env.unwrapped.set_intervening(not env.unwrapped.is_intervening)
+                        panel_phase(kb, 'RECORD', '人工接管' if env.unwrapped.is_intervening else '模型控制')
                         continue
                     if k in ('q', 'Q'):
                         # 操作失误只标记待排除；原始数据保留，仍进 RETURN。
@@ -707,6 +722,7 @@ def main(policy=None, on_episode_saved=None):
                     q_before = (np.asarray(env.joint_pos[:N_ARM]).copy()
                                 if env.joint_pos is not None else None)
                     kb.reassert()
+                    panel_phase(kb, 'RETURN', '人工控制 · 已排除' if discard else '人工控制')
                     print(f'\n[RETURN] {KEYS_BY_PHASE["RETURN"]}')
                     print('  ★ 主臂**仍然控制**从臂。把从臂带回起点附近（管子顺势拔出），')
                     print('    这也会把主臂自己带回它的家 —— 解决主臂漂移的关键一步。')
@@ -717,6 +733,7 @@ def main(policy=None, on_episode_saved=None):
                             break
                         if k in ('q', 'Q'):
                             discard = not discard
+                            panel_phase(kb, 'RETURN', '人工控制 · 已排除' if discard else '人工控制')
                             print(f'  {"已标记为待排除（仍保存）" if discard else "取消待排除标记"}'
                                   f'（按 c 结束回程）')
                             continue
@@ -750,6 +767,7 @@ def main(policy=None, on_episode_saved=None):
                 review = dict(quality_failed=quality_failed, quality_bad_steps=quality_bad_steps,
                               short_episode=short_episode, operator_excluded=bool(discard),
                               safety_error=safety_error)
+                panel_phase(kb, 'SAVE')
                 saved_meta = recorder.finish({
                         'index': ep, 'start_info': st,
                         'native_feedback_diagnostics': (env.unwrapped.feedback_diagnostics()
@@ -817,6 +835,7 @@ def main(policy=None, on_episode_saved=None):
                     json.dump(meta, f, ensure_ascii=False, indent=2)
                 ep += 1
                 if on_episode_saved is not None and not quit_now:
+                    panel_phase(kb, 'REVIEW')
                     if not on_episode_saved(epfile, saved_meta):
                         delivery_failed = True
                         print("标注/提交未完成，停止本次会话；本段可稍后补交，也可放弃；可重新启动下一场。")

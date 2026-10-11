@@ -29,7 +29,7 @@ class DeadlineTests(unittest.TestCase):
             with patch.object(config, 'SO101Env', flow.StubEnv), \
                  patch.object(recorder, 'NonBlockingKey', return_value=flow.StubKeys(['c','c'])), \
                  patch.object(recorder, 'actor_deadline_expired', side_effect=lambda d:d is not None and len(calls)>=2), \
-                 patch.object(sys, 'argv', ['record', '--out',directory,'--episodes','1']), \
+                 patch.object(sys, 'argv', ['record', '--terminal-controls', '--out',directory,'--episodes','1']), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(recorder.main(policy=policy),0)
             files=list(Path(directory).glob('*/ep_*.pkl'))

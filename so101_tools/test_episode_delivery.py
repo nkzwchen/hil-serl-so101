@@ -30,6 +30,19 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(flow.process(self.path))
         self.assertEqual(len(self.uploads),2)
 
+    def test_skip_keeps_raw_and_never_uploads_then_explicit_review_can_submit(self):
+        before=self.path.read_bytes()
+        flow=self.flow(reviewer=lambda p:'skip')
+        self.assertTrue(flow.process(self.path))
+        self.assertEqual(self.status()['status'],'skipped')
+        self.assertEqual(self.path.read_bytes(),before)
+        self.assertFalse(self.uploads)
+        flow=self.flow()
+        self.assertTrue(flow.process(self.path,review=False))
+        self.assertFalse(self.uploads)
+        self.assertTrue(flow.process(self.path,review=True))
+        self.assertEqual(self.status()['status'],'submitted')
+
     def test_close_without_confirmation_never_uploads_even_existing_label(self):
         def cancel(p): raise subprocess.CalledProcessError(3,'labeler')
         flow=self.flow(reviewer=cancel)

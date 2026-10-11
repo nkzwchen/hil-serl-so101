@@ -155,7 +155,7 @@ class Monitor:
             signature = json.dumps(pending, sort_keys=True)
             if signature != self.pending_signature:
                 self.pending_step += 1
-                for state in ('pending_label','pending_upload','pending_submit','submitted','excluded','untracked'):
+                for state in ('pending_label','pending_upload','pending_submit','submitted','excluded','skipped','untracked'):
                     self.scalar('local_queue/'+state, pending.get(state,0), self.pending_step)
                 self.pending_signature = signature
         self.writer.flush()
