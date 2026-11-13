@@ -4,11 +4,14 @@ import time
 from takeover_settings import load_limit, save_limit, validate_limit
 
 PHASES = {
+ 'REPLAY_READY': ('双臂回放确认', 'cqx', 'C 双手离开后开始回放 · Q 跳过 · X 退出'),
+ 'REPLAY': ('双臂回放中', 'dx', 'D 停止回放 · X 停止并退出；双臂均有力矩'),
  'CHECK': ('前置检查', '', '正在检查设备，请稍候'),
  'PRECISE': ('归位 / 对齐', 'x', '机械臂可能自动运动；退出需等待当前操作返回'),
  'READY': ('准备就绪', 'cqx', 'C 开始本段 · Q 跳过当前起点 · X 退出'),
  'POLICY': ('检查模型版本', '', '段间检查新权重，请稍候'),
- 'RECORD': ('录制中', ' dqxh', '空格 切换接管 · D 结束本段 · Q 排除本段 · X 退出'),
+ 'RECORD': ('录制中', ' dqxh', '空格 暂停模型 / 交还模型 · D 结束本段 · Q 排除本段 · X 退出'),
+ 'TAKEOVER_PAUSE': ('暂停等待接管', ' dqxh', '模型已暂停、不录数据；空格正式接管并建立基准 · D 结束 · X 退出'),
  'RECORD_MANUAL': ('人工录制中', 'dqxh', 'D 结束本段 · Q 排除本段 · X 退出；主臂控制从臂'),
  'RETURN': ('人工回程', 'cqx', '主臂仍控制从臂；回到起点附近后按 C · Q 切换排除'),
  'SAVE': ('保存数据', '', '正在保存本地原始数据'),
@@ -165,6 +168,9 @@ def _window(conn):
                 while conn.poll():
                     msg=conn.recv()
                     if msg[0]=='stop':root.destroy();return
+                    if msg[0]=='visible':
+                        root.deiconify() if msg[1] else root.withdraw()
+                        continue
                     if msg[0]=='ack':
                         _,generation,key,latency=msg
                         if generation==state['generation']:
@@ -222,6 +228,8 @@ class ControlPanel:
                 event.update(next_phase=phase, phase_latency_ms=(time.monotonic()-event['pressed_monotonic_s'])*1000)
                 print(f'[按键阶段] {event["key"]!r} → {phase}: {event["phase_latency_ms"]:.1f} ms',flush=True)
         self.conn.send(('state',phase,self.gate.generation,detail))
+    def set_visible(self, visible):
+        self.conn.send(('visible', bool(visible)))
     def read_key(self):
         self._receive();key=self.gate.read()
         if key is not None and not self.gate.closed:

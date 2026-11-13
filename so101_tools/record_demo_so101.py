@@ -203,9 +203,14 @@ def preflight(args, env, kb):
 
     # 6) disk
     need = args.episodes * 100 * BYTES_PER_STEP_AT_224 * 3
+    if getattr(raw, "full_frame_size", None):
+        width, height = raw.full_frame_size
+        need = args.episodes * raw.max_episode_steps * width * height * 3 * 2 * 8
     p = os.path.abspath(args.out or '.')          # 目录可能还不存在，往上找到有的
     while p and not os.path.isdir(p):
         p = os.path.dirname(p)
+    if not getattr(raw, 'camera_keys', ('cam_main',)):
+        need = args.episodes * raw.max_episode_steps * 16384 * 8
     free = shutil.disk_usage(p or '.').free
     print(f'  磁盘剩余        : {free/1e9:.1f} GB   计划 {args.episodes} 段 '
           f'预计需要 {need/1e9:.1f} GB')
@@ -393,7 +398,7 @@ def actor_deadline_expired(deadline):
     return deadline is not None and time.monotonic() >= deadline
 
 
-def main(policy=None, on_episode_saved=None, control_hz=None):
+def main(policy=None, on_episode_saved=None, control_hz=None, config_factory=None, after_local_save=None):
     delivery_failed = False
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='recordings', help='session parent directory')
@@ -419,10 +424,13 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
     from experiments.so101.env import SO101Env
     from experiments.so101.config import TrainConfig
 
-    cfg = TrainConfig()
+    cfg = config_factory() if config_factory else TrainConfig()
     if control_hz is not None:
         cfg.MAX_EPISODE_STEPS = math.ceil(cfg.MAX_EPISODE_STEPS / cfg.ENV_HZ * control_hz)
         cfg.ENV_HZ = float(control_hz)
+    if policy is not None and hasattr(policy, 'before_episode'):
+        print('控制窗口打开前：检查云端权重并预热模型……', flush=True)
+        policy.before_episode()
     rclpy.init()
     # ★★ 必须走 TrainConfig().get_environment()，拿**包装后**的 env ★★
     #   裸 SO101Env 的观测是嵌套的 {'state': {...}, 'images': {...}}，而训练侧要的是
@@ -469,7 +477,9 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                 'control_backend': cfg.CONTROL_BACKEND,
                 'pose_alignment': cfg.POSE_ALIGNMENT,
                 'max_episode_steps': env.unwrapped.max_episode_steps,
-                'image_size': cfg.IMAGE_SIZE, 'action_dim': N_ACTION,
+                'use_cameras': getattr(cfg, 'use_cameras', True),
+                'full_frame_size': getattr(cfg, 'full_frame_size', None),
+                'image_size': cfg.IMAGE_SIZE if not getattr(cfg, 'full_frame_size', None) else None, 'action_dim': N_ACTION,
                 'action_semantics': cfg.ACTION_SEMANTICS,
                 'observation_semantics': cfg.OBSERVATION_SEMANTICS,
                 'action_scale_rad': cfg.ACTION_SCALE,
@@ -501,6 +511,15 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
             ep, quit_now = 0, False
             attempt, n_discarded = 0, 0
             while ep < args.episodes and not quit_now:
+                if attempt > 0 and policy is not None and hasattr(policy, 'before_episode'):
+                    panel_phase(kb, 'POLICY')
+                    if hasattr(kb, 'set_visible'):kb.set_visible(False)
+                    try:
+                        print('下一段窗口显示前：检查云端权重并预热模型……', flush=True)
+                        policy.before_episode()
+                    finally:
+                        if hasattr(kb, 'set_visible'):kb.set_visible(True)
+                    if hasattr(kb, 'check'):kb.check()
                 key_timing_start = len(kb.timing_events()) if hasattr(kb, 'timing_events') else 0
                 if hasattr(kb, 'check'):kb.check()
                 panel_phase(kb, 'PRECISE', f'第 {ep+1}/{args.episodes} 段')
@@ -578,12 +597,6 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                 if redo:
                     continue          # 回到 PRECISE，ep 不变
 
-                if policy is not None and hasattr(policy, 'before_episode'):
-                    # READY has completed, no control step is in flight; deadline starts later.
-                    panel_phase(kb, 'POLICY')
-                    policy.before_episode()
-                    if hasattr(kb, 'check'):kb.check()
-
                 # Refresh after the operator's READY wait without issuing a motor command.
                 # TrainConfig fixes this chain to ChunkingWrapper(SERLObsWrapper(raw)).
                 fresh_obs = env.env.observation(env.unwrapped._get_obs())
@@ -611,15 +624,18 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                     print('  SPACE = toggle human intervention; rewards wait for episode annotation')
                 epfile = os.path.join(outdir, f'ep_{ep:04d}.pkl')
                 recorder = AsyncEpisodeRecorder(epfile)
-                n_steps, n_itv, quality_bad_steps, t_start = 0, 0, 0, time.time()
+                n_steps, n_itv, quality_bad_steps, t_start = 0, 0, 0, time.monotonic()
                 deadline = time.monotonic() + ACTOR_EPISODE_SECONDS if policy is not None else None
                 episode_timeout = False
                 camera_repeat_streak = {}
                 safety_error = None
                 done, truncated = False, False
                 pending_record_key = None
+                pause_started = None
+                pause_events = []
+                pending_segment_start = False
                 while not done:
-                    if actor_deadline_expired(deadline):
+                    if pause_started is None and actor_deadline_expired(deadline):
                         episode_timeout = truncated = True
                         break
                     k = pending_record_key if pending_record_key is not None else poll(kb, 'dDqQxXhH ')
@@ -628,6 +644,35 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                         done = True
                         break  # Finish existing samples; do not issue an extra control step.
                     if policy is not None and k == ' ':
+                        if pause_started is not None:
+                            try:
+                                env.unwrapped.start_human_intervention()
+                                fresh_obs = env.env.observation(env.unwrapped._get_obs())
+                                env.current_obs.clear()
+                                env.current_obs.extend([fresh_obs] * env.obs_horizon)
+                            except (RuntimeError, KeyboardInterrupt) as exc:
+                                safety_error = f'{type(exc).__name__}: {exc}'
+                                quit_now = truncated = True
+                                break
+                            duration = time.monotonic()-pause_started
+                            pause_events.append(dict(before_step=n_steps,duration_s=duration,resumed=True))
+                            if deadline is not None:deadline += duration
+                            pause_started = None
+                            takeover_budget.count += 1
+                            pending_segment_start = n_steps > 0
+                            camera_repeat_streak.clear()
+                            panel_phase(kb, 'RECORD', takeover_budget.detail(True))
+                            continue
+                        if not env.unwrapped.is_intervening:
+                            if takeover_budget.limit and takeover_budget.count >= takeover_budget.limit:
+                                takeover_budget.limit_reached = True
+                                print(f'  已达接管上限 {takeover_budget.limit} 次；本次空格按 D 结束录制。', flush=True)
+                                done = True
+                                break
+                            pause_started = time.monotonic()
+                            panel_phase(kb, 'TAKEOVER_PAUSE', '暂停 · 再按空格正式接管；暂停时间不计入20秒执行预算')
+                            print('  模型已暂停；不录数据。再次按空格开始人工接管并记录新的差分基准。',flush=True)
+                            continue
                         if takeover_budget.press_space(env.unwrapped.is_intervening):
                             print(f'  已达本段接管上限 {takeover_budget.limit} 次；本次空格按 D 处理，结束录制并进入人工回程。',flush=True)
                             done = True
@@ -646,6 +691,9 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                         break
                     if k in ('h', 'H'):
                         print(f'  [RECORD] {KEYS_BY_PHASE["RECORD"]}')
+                        continue
+                    if pause_started is not None:
+                        time.sleep(.01)
                         continue
                     if env.unwrapped.hz == 10 or control_hz is not None:
                         env.unwrapped.begin_control_cycle()
@@ -718,6 +766,7 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                         next_observations=next_obs, rewards=0.0,
                         masks=0.0 if done else 1.0, dones=bool(done),
                         infos={'intervening': itv, 'phase': 'record',
+                               'segment_start': pending_segment_start,
                                'observation_quality': obs_quality,
                                'next_observation_quality': next_quality,
                                'repeated_camera_frames': repeated_cameras,
@@ -729,15 +778,25 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                                'joint_control': info.get('joint_control')},
                     )
                     quality_bad_steps += int(bool(quality_problems))
+                    if getattr(cfg, 'full_frame_size', None) or not getattr(cfg, 'use_cameras', True):
+                        packet['infos']['both_arms_after'] = dict(
+                            follower_rad=env.unwrapped.joint_pos.tolist(),
+                            leader_rad=env.unwrapped.leader_pos.tolist(),
+                            follower_stamp=env.unwrapped._joint_stamp,
+                            leader_stamp=env.unwrapped._leader_stamp)
                     if not recorder.submit(packet):
                         quality_failed = True
                         if len(recorder.dropped) == 1:
                             print('  保存队列异常：继续控制，缺失步将明确标记，不能直接用于训练。')
                     n_steps += 1
+                    pending_segment_start = False
+                if pause_started is not None:
+                    pause_events.append(dict(before_step=n_steps,duration_s=time.monotonic()-pause_started,resumed=False))
                 if episode_timeout:
                     print('  达到 20 秒执行时限：停止本段策略执行，进入人工回程；保留数据供标注。')
-                seg_sec = time.time() - t_start
-                hz_act = n_steps / max(seg_sec, 1e-6)
+                seg_sec = time.monotonic() - t_start
+                paused_sec = sum(p['duration_s'] for p in pause_events)
+                hz_act = n_steps / max(seg_sec-paused_sec, 1e-6)
 
                 # Short segments are retained with an explicit review flag.
                 short_episode = n_steps < args.min_steps
@@ -803,6 +862,9 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                         'native_feedback_diagnostics': (env.unwrapped.feedback_diagnostics()
                             if hasattr(env.unwrapped, 'feedback_diagnostics') else None),
                         'episode_timeout': episode_timeout,
+                        'takeover_pauses': pause_events,
+                        'paused_sec': paused_sec,
+                        'active_record_sec': max(0.,seg_sec-paused_sec),
                         'max_takeovers': takeover_budget.limit,
                         'takeover_count': takeover_budget.count,
                         'takeover_limit_reached': takeover_budget.limit_reached,
@@ -810,6 +872,8 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                         'policy': getattr(policy, 'metadata', None),
                         'capture_policy': 'retain_all_with_quality_flags_v1',
                         **review,
+                        'use_cameras': getattr(cfg, 'use_cameras', True),
+                        'full_frame_size': getattr(cfg, 'full_frame_size', None),
                         'action_dim': N_ACTION,
                         'action_semantics': cfg.ACTION_SEMANTICS,
                         'observation_semantics': cfg.OBSERVATION_SEMANTICS,
@@ -867,6 +931,9 @@ def main(policy=None, on_episode_saved=None, control_hz=None):
                 with open(os.path.join(outdir, 'meta.json'), 'w', encoding='utf-8') as f:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
                 ep += 1
+                if after_local_save is not None and not quit_now:
+                    if not after_local_save(env, kb, epfile, saved_meta):
+                        quit_now = True
                 if on_episode_saved is not None and not quit_now:
                     panel_phase(kb, 'REVIEW')
                     if not on_episode_saved(epfile, saved_meta):

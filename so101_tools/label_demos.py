@@ -87,11 +87,12 @@ def _squeeze(x):
 
 def _ep_from_transitions(trs):
     """Extract the fields the labeler needs from a transition list."""
-    frames = {'actions': [], 'intervening': [], 'joint_pos': [], 'states': []}
+    frames = {'actions': [], 'intervening': [], 'joint_pos': [], 'states': [], 'segment_start': []}
     cams = {}
     for t in trs:
         obs = t.get('observations', {}) or {}
         info = t.get('infos', {}) or {}
+        frames['segment_start'].append(bool(info.get('segment_start')))
         for k, v in obs.items():
             if k == 'state':
                 continue
@@ -110,6 +111,7 @@ def _ep_from_transitions(trs):
         frames['states'].append(_squeeze(final.get('state')))
         frames['actions'].append(np.full_like(frames['actions'][-1], np.nan))  # No action follows final observation.
         frames['intervening'].append(False)
+        frames['segment_start'].append(False)
     T = len(trs) + bool(trs)
     for k in cams:
         frames[k] = cams[k]
@@ -631,6 +633,10 @@ class Labeler:
             self.playing = False
 
     def _mark_success(self):
+        boundaries = self.episodes[self.ep].get('segment_start', [])
+        if self.fr < len(boundaries) and boundaries[self.fr]:
+            print('这是暂停后重新开始的观测，请选择执行动作后的成功帧。')
+            return
         if self.fr < 1:
             print('请选择 frame >= 1：第 0 帧之前没有可赋奖励的动作。')
             return

@@ -94,7 +94,18 @@ class TrainConfig(DefaultTrainingConfig):
     TARGET_JOINT_POSE = None
     TARGET_TOL = 0.15
 
-    def __init__(self):
+    def __init__(self, full_frame_size=None, use_cameras=True):
+        self.use_cameras = use_cameras
+        self.full_frame_size = full_frame_size
+        if not use_cameras:
+            self.full_frame_size = None
+            self.roi_spec = self.main_roi_spec = None
+            self.image_keys = []
+            return
+        if full_frame_size:
+            self.roi_spec = self.main_roi_spec = None
+            self.image_keys = ["cam_main"]
+            return
         self.roi_spec = load_roi()
         self.main_roi_spec = load_main_roi()
         if not self.roi_spec or not self.main_roi_spec:
@@ -132,6 +143,8 @@ class TrainConfig(DefaultTrainingConfig):
             from experiments.so101.native_env import NativeSO101Env
             SO101Env = NativeSO101Env
         env = SO101Env(
+            use_cameras=self.use_cameras,
+            full_frame_size=self.full_frame_size,
             roi_spec=self.roi_spec,
             main_roi_spec=self.main_roi_spec,
             hz=self.ENV_HZ,

@@ -109,6 +109,9 @@ class StubEnv(gym.Env):
     def is_intervening(self):
         return self._intervening
 
+    def start_human_intervention(self):
+        self.set_intervening(True)
+
     def set_intervening(self, on):
         self._intervening = bool(on)
 

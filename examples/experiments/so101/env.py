@@ -134,11 +134,18 @@ class SO101Env(gym.Env):
         main_roi_spec=None,
         node_name: str = 'so101_rl_env',
         randomize_joint_half_deg: float = 1.5,
+        full_frame_size=None,
+        use_cameras=True,
     ):
         super().__init__()
+        self.camera_keys = CAMERA_KEYS if use_cameras else ()
+        self.full_frame_size = full_frame_size  # (width,height), opt-in recording only
+        if full_frame_size and (roi_spec or main_roi_spec):
+            raise ValueError("Full-frame capture cannot use ROI")
+        self.image_shape = (full_frame_size[1], full_frame_size[0], 3) if full_frame_size else (image_size, image_size, 3)
         self.roi_spec = roi_spec
         self.main_roi_spec = main_roi_spec
-        self.image_keys = list(CAMERA_KEYS) + (['cam_main_roi'] if roi_spec else [])
+        self.image_keys = list(self.camera_keys) + (['cam_main_roi'] if roi_spec and use_cameras else [])
         self.hz = float(hz)
         self.action_scale = float(action_scale)
         self.action_semantics = ACTION_SEMANTICS
@@ -191,14 +198,14 @@ class SO101Env(gym.Env):
                                  'first_arrival': 0.0, 'max_gap_s': 0.0,
                                  'pending_replaced': 0, 'duplicate_messages': 0,
                                  'processing_expired': 0, 'processing_delay_s': 0.0}
-                              for k in CAMERA_KEYS}
+                              for k in self.camera_keys}
         self._last_obs_quality = {}
         self._image_workers = {
             cam: LatestFrameWorker(
                 lambda msg, arrival, key=cam: self._process_image(msg, key, arrival),
                 name=f'{cam}_latest_frame',
                 on_error=lambda exc, key=cam: self._image_worker_error(key, exc))
-            for cam in CAMERA_KEYS}
+            for cam in self.camera_keys}
 
 
         # QoS：图像这类高频大数据用 BEST_EFFORT 更稳（丢帧没关系）
@@ -216,7 +223,7 @@ class SO101Env(gym.Env):
         self.create_sub = self.node.create_subscription
         self.create_sub(JointState, '/follower/joint_states', self._on_joint, qos_js)
         self.create_sub(JointState, '/leader/joint_states', self._on_leader, qos_js)
-        for cam in CAMERA_KEYS:
+        for cam in self.camera_keys:
             self.create_sub(
                 Image, f'/follower/{cam}/image_raw',
                 lambda msg, k=cam: self._on_image(msg, k), qos_img,
@@ -286,7 +293,7 @@ class SO101Env(gym.Env):
                 'hold_offset': gym.spaces.Box(-np.inf, np.inf, (N_ACTION,), dtype=f32),
             }),
             'images': gym.spaces.Dict({k: gym.spaces.Box(
-                0, 255, (self.img_size, self.img_size, 3), dtype=np.uint8)
+                0, 255, self.image_shape, dtype=np.uint8)
                 for k in self.image_keys}),
         })
         # 3D tool-origin action; four joints remain actuated.
@@ -496,6 +503,15 @@ class SO101Env(gym.Env):
         """
         self._intervening = bool(on)
 
+    def start_human_intervention(self):
+        """Capture the differential anchors now, not on a later step."""
+        now = time.monotonic()
+        if (self.joint_pos is None or self.leader_pos is None or
+                now-self._joint_stamp > .25 or now-self._leader_stamp > .25):
+            raise RuntimeError('Fresh leader/follower feedback required to resume intervention')
+        self._enter_mode('human', refresh=True)
+        self.set_intervening(True)
+
     @property
     def is_intervening(self) -> bool:
         """人类是否正在接管。
@@ -505,13 +521,13 @@ class SO101Env(gym.Env):
         """
         return bool(self._intervening)
 
-    def _enter_mode(self, mode: str):
+    def _enter_mode(self, mode: str, refresh=False):
         """切换控制模式并管理力矩（只在模式变化时执行一次）。
 
         ★ 进入人类接管时记下差分基准 (follower 已接受指令, leader 实测) —— 见 step()
           里模式 B 的说明。漏掉它会让从臂在接管瞬间跳回主臂所在姿态。
         """
-        if mode == self._last_mode:
+        if mode == self._last_mode and not refresh:
             return
         if mode == 'human':
             # 人类接管：leader 必须松开，否则人手和电机较劲（抖振/发热）
@@ -617,7 +633,9 @@ class SO101Env(gym.Env):
                     stats['processing_expired'] += 1
                     return
             rgb = decode_rgb(msg)
-            images = {key: cv2.resize(rgb, (self.img_size, self.img_size),
+            if self.full_frame_size and rgb.shape != self.image_shape:
+                raise ValueError(f"Full-frame source shape {rgb.shape} != configured {self.image_shape}; no resizing allowed")
+            images = {key: rgb.copy() if self.full_frame_size else cv2.resize(rgb, (self.img_size, self.img_size),
                                      interpolation=cv2.INTER_AREA)}
             if key == 'cam_main' and self.main_roi_spec:
                 images['cam_main'] = crop_roi(rgb, self.main_roi_spec, self.img_size)
@@ -658,7 +676,7 @@ class SO101Env(gym.Env):
             if not stats['valid'] or age is None or age > max_age:
                 problems.append(f'{key}: missing/invalid/stale ({age})')
         stamps = [v['source_stamp_ns'] for v in self._camera_stats.values()]
-        skew = (max(stamps) - min(stamps)) / 1e9
+        skew = (max(stamps) - min(stamps)) / 1e9 if stamps else 0.0
         warnings = []
         if all(stamps) and skew > max_skew:
             warnings.append(f'camera skew {skew:.3f}s')
@@ -701,7 +719,7 @@ class SO101Env(gym.Env):
             vel = np.zeros(6, dtype=np.float32)
         images = {}
         for cam in self.image_keys:
-            images[cam] = imgs.get(cam, np.zeros((self.img_size, self.img_size, 3), np.uint8))
+            images[cam] = imgs.get(cam, np.zeros(self.image_shape, np.uint8))
         if self.display_image:
             try:
                 show = np.concatenate([images[k] for k in self.image_keys], axis=1)

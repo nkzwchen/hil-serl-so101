@@ -50,6 +50,18 @@ class HumanRewardTests(unittest.TestCase):
         self.assertEqual([float(t['masks']) for t in ts],[1,1,0])
         self.assertEqual(receipt['transitions'],3)
 
+    def test_pause_boundary_keeps_own_next_observation(self):
+        self.ts[2]['infos']['segment_start'] = True
+        self.save()
+        ts, _ = load_episode(self.path, self.cfg)
+        self.assertTrue(ts[1]['dones'])
+        self.assertEqual(float(ts[1]['masks']), 1.)
+        self.assertEqual(float(ts[1]['rewards']), 0.)
+        self.lab['frame'] = 2
+        self.save()
+        with self.assertRaisesRegex(ValueError, 'pause boundary'):
+            load_episode(self.path, self.cfg)
+
     def test_explicit_failure(self):
         self.lab=dict(status='failed',reviewed=True,source='human_review');self.save()
         ts,_=load_episode(self.path,self.cfg)

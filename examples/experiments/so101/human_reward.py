@@ -89,6 +89,8 @@ def load_episode(path, config, allow_provisional=False):
     if isinstance(end, bool) or not isinstance(end, int) or not 1 <= end <= len(ts):
         raise ValueError('Success observation frame must be in 1..N')
     env = config.get_environment(fake_env=True)
+    if success and end < len(ts) and ts[end].get('infos', {}).get('segment_start'):
+        raise ValueError('Success frame lies at a pause boundary; select a frame after an executed action')
     result = []
     for i, raw_t in enumerate(ts[:end]):
         for field in ('observations', 'next_observations'):
@@ -103,7 +105,8 @@ def load_episode(path, config, allow_provisional=False):
             raise ValueError('Invalid action')
         t = {key: raw_t[key] for key in ('observations', 'actions', 'next_observations')}
         final = i == end - 1
-        t.update(rewards=np.float32(success and final), masks=np.float32(not (success and final)), dones=final)
+        boundary = i+1 < len(ts) and bool(ts[i+1].get('infos', {}).get('segment_start'))
+        t.update(rewards=np.float32(success and final), masks=np.float32(not (success and final)), dones=final or boundary)
         result.append(t)
     receipt = dict(id=hashlib.sha256((digest + json.dumps(lab, sort_keys=True)).encode()).hexdigest(),
                    recording_sha256=digest, file=path.name, label=copy.deepcopy(lab),

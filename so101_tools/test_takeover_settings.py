@@ -26,7 +26,7 @@ class TakeoverTests(unittest.TestCase):
         b=TakeoverBudget(0)
         for _ in range(20):self.assertFalse(b.press_space(False))
     def test_third_takeover_ends_record_without_extra_action(self):
-        phase=[''];keys=iter([None,None,' ',' ',' ',' ',' ']);executed=[]
+        phase=[''];keys=iter([None,None,' ',' ',' ',' ',' ',' ',' ']);executed=[]
         class Env(flow.StubEnv):
             def step(self,a):
                 if phase[0]=='RECORD':executed.append(self.is_intervening)
@@ -35,7 +35,7 @@ class TakeoverTests(unittest.TestCase):
             def get_max_takeovers(self):return 2
         def poll(kb,accept):
             if phase[0] in ('READY','RETURN'):return 'c'
-            if phase[0]=='RECORD':return next(keys,'d')
+            if phase[0] in ('RECORD','TAKEOVER_PAUSE'):return next(keys,'d')
             return None
         with tempfile.TemporaryDirectory() as d:
             with patch.object(config,'SO101Env',Env), \

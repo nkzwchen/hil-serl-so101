@@ -14,7 +14,7 @@ REPO = HERE / 'hil-serl' if (HERE / 'hil-serl').is_dir() else HERE.parent
 MODULE = REPO / 'examples/experiments/so101'
 sys.path.insert(0, str(MODULE))
 from joint_control import CommandHold, bounded_joint_delta, execute_joint_request
-from so101_home_pose import START_JOINT_POSE, Q_LOW, Q_HIGH, hold_frozen
+from so101_home_pose import START_JOINT_POSE, Q_LOW, Q_HIGH, hold_frozen, N_ACTION, CONTROLLED_IDX
 
 
 class JointTests(unittest.TestCase):
@@ -28,11 +28,11 @@ class JointTests(unittest.TestCase):
                 arg.annotation = None
         ns = dict(np=np, math=math, time=SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None),
                   bounded_joint_delta=bounded_joint_delta, execute_joint_request=execute_joint_request,
-                  N_ACTION=4, N_ARM=5, CONTROLLED_IDX=(0,1,2,3), JOINT_LOW=Q_LOW,
+                  N_ACTION=N_ACTION, N_ARM=5, CONTROLLED_IDX=CONTROLLED_IDX, JOINT_LOW=Q_LOW,
                   JOINT_HIGH=Q_HIGH, hold_frozen=hold_frozen)
         exec(compile(ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[])), '<production joint step>', 'exec'), ns)
         q = START_JOINT_POSE[:5].copy(); hold=CommandHold()
-        offset=np.array([0,-.01,-.02,.01,0]);hold.calibrate(q+offset,q)
+        offset=np.array([0,-.01,-.02,0,0]);hold.calibrate(q+offset,q)
         sent=[]
         env=SimpleNamespace(node=SimpleNamespace(get_logger=lambda: SimpleNamespace(warn=lambda _: None, info=lambda _: None)),
             joint_pos=np.r_[q,.32],leader_pos=np.r_[q,.32],_joint_stamp=time.monotonic(),_leader_stamp=time.monotonic(),
@@ -47,34 +47,34 @@ class JointTests(unittest.TestCase):
         return env,sent
 
     def test_action_dimension_finiteness_and_units(self):
-        np.testing.assert_allclose(bounded_joint_delta([2,-2,.5,0],.02),[.02,-.02,.01,0])
-        for bad in ([0,0,0],[0]*5,[np.nan,0,0,0]):
+        np.testing.assert_allclose(bounded_joint_delta([2,-2,.5],.02),[.02,-.02,.01])
+        for bad in ([0,0],[0]*4,[np.nan,0,0]):
             with self.assertRaises(ValueError):bounded_joint_delta(bad)
 
     def test_zero_holds_command_despite_measurement_noise(self):
         env,sent=self.fixture();wanted=env._command_hold.target()
         for _ in range(10):
-            env.joint_pos[1]+=.0001;env.step(np.zeros(4))
+            env.joint_pos[1]+=.0001;env.step(np.zeros(N_ACTION))
             np.testing.assert_array_equal(sent[-1],wanted)
 
     def test_increment_accumulates_without_measured_tracking_gate(self):
         env,sent=self.fixture();start=env._command_hold.target()
-        env.step([.5,0,0,0]);env.step([.5,0,0,0])
+        env.step([.5,0,0]);env.step([.5,0,0])
         self.assertAlmostEqual(sent[-1][0]-start[0],.02)
-        for _ in range(20):env.step([1,0,0,0])
+        for _ in range(20):env.step([1,0,0])
         self.assertAlmostEqual(sent[-1][0]-start[0],.42)
         self.assertFalse(env._joint_control_status['limited'])
 
     def test_human_anchor_freezes_roll_and_ignores_camera_quality(self):
         env,sent=self.fixture();wanted=env._command_hold.target();env.is_intervening=True
         env.observation_quality=lambda:{'ok':False}
-        env.step(np.zeros(4));np.testing.assert_array_equal(sent[-1],wanted)
+        env.step(np.zeros(N_ACTION));np.testing.assert_array_equal(sent[-1],wanted)
         env.leader_pos[0]+=.03;env.leader_pos[4]+=.4;env.leader_pos[5]+=.4
-        _,_,_,_,info=env.step(np.zeros(4))
+        _,_,_,_,info=env.step(np.zeros(N_ACTION))
         self.assertAlmostEqual(sent[-1][0]-wanted[0],.02)
         self.assertEqual(sent[-1][4],env.joint_pos[4])
         np.testing.assert_allclose(info['intervene_action'],info['joint_control']['requested_action'],atol=1e-8)
-        env.step(np.zeros(4));self.assertAlmostEqual(sent[-1][0]-wanted[0],.03)
+        env.step(np.zeros(N_ACTION));self.assertAlmostEqual(sent[-1][0]-wanted[0],.03)
 
     def test_enter_human_with_tracking_lag_does_not_rebase_command(self):
         env,sent=self.fixture();wanted=env._command_hold.target()
@@ -83,25 +83,25 @@ class JointTests(unittest.TestCase):
         env.is_intervening=True;env._last_mode='policy'
         env.set_leader_torque=lambda _:True
         env._enter_mode=env._production_enter_mode
-        env.step(np.zeros(4))
+        env.step(np.zeros(N_ACTION))
         np.testing.assert_allclose(sent[-1],wanted,atol=1e-12)
-        np.testing.assert_array_equal(env._last_joint_action,np.zeros(4))
-        for i in range(4):
+        np.testing.assert_array_equal(env._last_joint_action,np.zeros(N_ACTION))
+        for i in CONTROLLED_IDX:
             env.leader_pos[i]+=.005
-            env.step(np.zeros(4))
+            env.step(np.zeros(N_ACTION))
             wanted[i]+=.005
             np.testing.assert_allclose(sent[-1],wanted,atol=1e-12)
 
     def test_reenter_human_uses_new_command_and_leader_baselines(self):
         env,sent=self.fixture();env.set_leader_torque=lambda _:True
         env._enter_mode=env._production_enter_mode;env._last_mode='policy'
-        env.is_intervening=True;env.step(np.zeros(4))
-        env.is_intervening=False;env.step([.5,0,0,0])
+        env.is_intervening=True;env.step(np.zeros(N_ACTION))
+        env.is_intervening=False;env.step([.5,0,0])
         wanted=env._command_hold.target()
         env.leader_pos[0]+=.1
-        env.is_intervening=True;env.step(np.zeros(4))
+        env.is_intervening=True;env.step(np.zeros(N_ACTION))
         np.testing.assert_allclose(sent[-1],wanted,atol=1e-12)
-        env.leader_pos[0]-=.005;env.step(np.zeros(4))
+        env.leader_pos[0]-=.005;env.step(np.zeros(N_ACTION))
         wanted[0]-=.005
         np.testing.assert_allclose(sent[-1],wanted,atol=1e-12)
 
@@ -110,10 +110,10 @@ class JointTests(unittest.TestCase):
         human.is_intervening=True;human.leader_pos[:4]+=[.04,.01,-.01,0]
         # Pan is already at its tracking boundary. Other joints must still update.
         for e in (human,policy):e.joint_pos[0]-=math.radians(3)
-        _,_,_,_,hi=human.step(np.zeros(4))
-        _,_,_,_,pi=policy.step([2,.5,-.5,0])
+        _,_,_,_,hi=human.step(np.zeros(N_ACTION))
+        _,_,_,_,pi=policy.step([2,.5,-.5])
         np.testing.assert_allclose(hs[-1],ps[-1],atol=1e-9)
-        np.testing.assert_allclose(hi['intervene_action'],[1,.5,-.5,0])
+        np.testing.assert_allclose(hi['intervene_action'],[1,.5,-.5])
         self.assertAlmostEqual(hi['joint_control']['applied_delta_rad'][0],.02)
         self.assertEqual(hi['joint_control']['held_joints'],[])
         self.assertNotEqual(hi['joint_control']['applied_delta_rad'][1],0.)
@@ -122,17 +122,17 @@ class JointTests(unittest.TestCase):
     def test_feedback_lag_does_not_reverse_or_hold_request(self):
         env,sent=self.fixture();start=env._command_hold.target()
         env.joint_pos[2]+=math.radians(3)+.002
-        env.step([.5,0,-1,.5])
+        env.step([.5,0,-1])
         self.assertAlmostEqual(sent[-1][2],start[2]-.02)
         self.assertAlmostEqual(sent[-1][0]-start[0],.01)
-        self.assertAlmostEqual(sent[-1][3]-start[3],.01)
+        self.assertAlmostEqual(sent[-1][3],env.joint_pos[3])
         self.assertEqual(env._joint_control_status['joint_reasons'][2],[])
 
     def test_replaying_human_request_reproduces_published_target(self):
         human,hs=self.fixture();policy,ps=self.fixture();human.is_intervening=True
         human.leader_pos[:4]+=[.04,.01,0,-.05]
         for _ in range(8):
-            _,_,_,_,info=human.step(np.zeros(4));policy.step(info['intervene_action'])
+            _,_,_,_,info=human.step(np.zeros(N_ACTION));policy.step(info['intervene_action'])
             np.testing.assert_allclose(hs[-1],ps[-1],atol=1e-8)
 
     def test_observation_exposes_full_command_and_compensation(self):
@@ -140,13 +140,13 @@ class JointTests(unittest.TestCase):
         env._joint_pos=env.joint_pos.copy();env._joint_vel=np.zeros(6,np.float32)
         env._images={};env._quality_locked=lambda:{};env.image_keys=[];env.display_image=False
         obs=env._production_get_obs()['state']
-        self.assertEqual(obs['command_error'].shape,(4,))
-        np.testing.assert_allclose(obs['joint_pos'][:4]+obs['command_error'],env._command_hold.target()[:4],atol=1e-7)
-        np.testing.assert_allclose(obs['hold_offset'],env._command_hold.offset[:4],atol=1e-7)
+        self.assertEqual(obs['command_error'].shape,(N_ACTION,))
+        np.testing.assert_allclose(obs['joint_pos'][list(CONTROLLED_IDX)]+obs['command_error'],env._command_hold.target()[list(CONTROLLED_IDX)],atol=1e-7)
+        np.testing.assert_allclose(obs['hold_offset'],env._command_hold.offset[list(CONTROLLED_IDX)],atol=1e-7)
 
     def test_camera_quality_is_diagnostic_for_both_sources(self):
         env,sent=self.fixture();env.observation_quality=lambda:{'ok':False}
-        start=env._command_hold.target();env.step([.5,0,0,0])
+        start=env._command_hold.target();env.step([.5,0,0])
         self.assertAlmostEqual(sent[-1][0]-start[0],.01)
 
     def test_missing_and_stale_leader_hold(self):
@@ -154,21 +154,21 @@ class JointTests(unittest.TestCase):
             env,sent=self.fixture();wanted=env._command_hold.target();env.is_intervening=True
             if missing:env._lead_anchor=None
             else:env._leader_stamp-=1
-            env.step(np.ones(4));np.testing.assert_array_equal(sent[-1],wanted)
+            env.step(np.ones(N_ACTION));np.testing.assert_array_equal(sent[-1],wanted)
             self.assertFalse(env._joint_control_status['accepted'])
 
     def test_stale_follower_refuses_publication(self):
         env,sent=self.fixture();env._joint_stamp-=1
-        with self.assertRaises(RuntimeError):env.step(np.ones(4))
+        with self.assertRaises(RuntimeError):env.step(np.ones(N_ACTION))
         self.assertEqual(sent,[])
 
     def test_no_pose_constraint_and_joint_limits(self):
         env,sent=self.fixture();env.joint_pos[3]+=.2
         env._command_hold.calibrate(env.joint_pos[:5],env.joint_pos[:5])
-        env.step([0,0,0,.5]);self.assertTrue(env._joint_control_status['accepted'])
+        env.step([0,0,.5]);self.assertTrue(env._joint_control_status['accepted'])
         env,sent=self.fixture();env.joint_pos[0]=Q_HIGH[0]-.005
         env._command_hold.calibrate(env.joint_pos[:5],env.joint_pos[:5])
-        env.step([1,0,0,0]);self.assertAlmostEqual(sent[-1][0],Q_HIGH[0])
+        env.step([1,0,0]);self.assertAlmostEqual(sent[-1][0],Q_HIGH[0])
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
