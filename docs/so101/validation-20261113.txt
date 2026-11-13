@@ -1,0 +1,69 @@
+..................................................................       [100%]
+=============================== warnings summary ===============================
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.action_scale to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.action_scale` for environment variables or `env.get_wrapper_attr('action_scale')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.hz to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.hz` for environment variables or `env.get_wrapper_attr('hz')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.max_episode_steps to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.max_episode_steps` for environment variables or `env.get_wrapper_attr('max_episode_steps')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.randomize_start to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.randomize_start` for environment variables or `env.get_wrapper_attr('randomize_start')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.joint_pos to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.joint_pos` for environment variables or `env.get_wrapper_attr('joint_pos')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.leader_pos to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.leader_pos` for environment variables or `env.get_wrapper_attr('leader_pos')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.set_follower_torque to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.set_follower_torque` for environment variables or `env.get_wrapper_attr('set_follower_torque')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.randomize_half_m to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.randomize_half_m` for environment variables or `env.get_wrapper_attr('randomize_half_m')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.set_intervening to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.set_intervening` for environment variables or `env.get_wrapper_attr('set_intervening')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+so101_tools/test_training_keys.py: 26 warnings
+so101_tools/test_takeover_settings.py: 13 warnings
+  <WORKSPACE>/hil-serl/serl_launcher/serl_launcher/wrappers/chunking.py:12: DeprecationWarning: jax.tree_map is deprecated: use jax.tree.map (jax v0.4.25 or newer) or jax.tree_util.tree_map (any JAX version).
+    return jax.tree_map(
+
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_stop_sends_no_record_action
+so101_tools/test_training_keys.py::TrainingKeyTests::test_during_inference_takeover_sends_only_human_action
+so101_tools/test_takeover_settings.py::TakeoverTests::test_third_takeover_ends_record_without_extra_action
+  <PYTHON_ENV>/lib/python3.12/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.set_intervene_deadband to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.set_intervene_deadband` for environment variables or `env.get_wrapper_attr('set_intervene_deadband')` that will search the reminding wrappers.[0m
+    logger.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+66 passed, 69 warnings in 4.16s
